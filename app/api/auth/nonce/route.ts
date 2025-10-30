@@ -21,7 +21,7 @@ export async function GET(req: NextRequest) {
     sameSite: "none",
     secure: true,
     path: "/",
-    maxAge: NONCE_TTL_SECONDS
+    maxAge: 600, // 10 min
   });
   return withCors(req, res);
 }
