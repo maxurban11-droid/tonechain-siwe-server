@@ -1,27 +1,31 @@
-import { NextResponse, type NextRequest } from "next/server";
-import { withCors, handleOptions } from "@/helpers/cors";
-import { setCookie } from "@/helpers/cookies";
-import { NONCE_TTL_SECONDS } from "@/helpers/env";
+// app/api/auth/nonce/route.ts
+import { NextResponse } from "next/server"
+import { withCORS } from "@/helpers/cors" // Pfad anpassen, falls kein baseUrl in tsconfig
 
-function makeNonce() {
-  const arr = new Uint8Array(24);
-  crypto.getRandomValues(arr);
-  return Buffer.from(arr).toString("base64url");
+function genNonce() {
+  // kurze, kryptografisch starke Nonce
+  return Array.from(crypto.getRandomValues(new Uint8Array(16)))
+    .map(b => b.toString(16).padStart(2, "0"))
+    .join("")
 }
 
-export async function OPTIONS(req: NextRequest) {
-  return handleOptions(req);
+// Für Preflight
+export function OPTIONS(req: Request) {
+  return withCORS(req, new NextResponse(null, { status: 204 }))
 }
 
-export async function GET(req: NextRequest) {
-  const nonce = makeNonce();
-  const res = NextResponse.json({ nonce }, { status: 200 });
-  setCookie(res, "tc_nonce", nonce, {
+// Nonce holen (GET)
+export async function GET(req: Request) {
+  const nonce = genNonce()
+
+  const res = NextResponse.json({ nonce })
+  // httpOnly Nonce-Cookie setzen (10 Min)
+  res.cookies.set("tc_nonce", nonce, {
     httpOnly: true,
     sameSite: "lax",
-    secure: undefined,
+    secure: true,            // Vercel = HTTPS
     path: "/",
-    maxAge: NONCE_TTL_SECONDS
-  });
-  return withCors(req, res);
+    maxAge: 60 * 10,
+  })
+  return withCORS(req, res)
 }
