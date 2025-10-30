@@ -2,7 +2,7 @@
   "version": 2,
   "functions": {
     "api/**/*.ts": {
-      "runtime": "vercel-node@3"
+      "runtime": "now-php@1.0.0"
     }
   }
 }
