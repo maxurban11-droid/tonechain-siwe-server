@@ -1,80 +1,77 @@
 // app/api/auth/verify/route.ts
-import { NextResponse } from "next/server"
+import { NextResponse, NextRequest } from "next/server"
 import { cookies, headers } from "next/headers"
-import { withCORS } from "@/helpers/cors"
+import { cors, preflight } from "@/helpers/cors"   // einheitlicher CORS-Helper
 import { SiweMessage } from "siwe"
-import { cors } from "@/helpers/cors"     // dein shared CORS-Helper
-
-export async function OPTIONS(req: Request) {
-  // 204 + korrekte CORS-Header zurück
-  return cors(req, new Response(null, { status: 204 }))
-}
-
-export function OPTIONS(req: Request) {
-  return withCORS(req, new NextResponse(null, { status: 204 }))
-}
 
 type Body = { message: string; signature: string }
 
-export async function POST(req: Request) {
+const SECURE = process.env.NODE_ENV === "production"
+
+export async function OPTIONS(req: Request) {
+  // Preflight: 204 + korrekte CORS-Header
+  return preflight(req)
+}
+
+export async function POST(req: NextRequest) {
   try {
+    // --- Payload prüfen ---
     const { message, signature } = (await req.json()) as Body
     if (!message || !signature) {
-      return withCORS(req, NextResponse.json({ ok: false, error: "Bad payload" }, { status: 400 }))
+      return cors(req, NextResponse.json({ ok: false, error: "Bad payload" }, { status: 400 }))
     }
 
-    // Nonce aus httpOnly-Cookie lesen
+    // --- Nonce aus httpOnly-Cookie ---
     const nonceCookie = cookies().get("tc_nonce")?.value
     if (!nonceCookie) {
-      return withCORS(req, NextResponse.json({ ok: false, error: "Missing nonce" }, { status: 400 }))
+      return cors(req, NextResponse.json({ ok: false, error: "Missing nonce" }, { status: 400 }))
     }
 
-    // Domain/Origin optional streng prüfen
+    // --- Domain/Origin aus Request-Headern (optional streng) ---
     const hdrs = headers()
     const host = hdrs.get("host") || ""
-    const origin = hdrs.get("origin") || ""
-    const domain = host.split(":")[0]
+    const domain = host.split(":")[0] // "example.com" ohne Port
 
-    // SIWE prüfen
+    // --- SIWE Verify ---
     const siwe = new SiweMessage(message)
     const result = await siwe.verify({
       signature,
       nonce: nonceCookie,
-      domain,                    // stellt sicher, dass die Message für diese Domain ist
+      domain,
       time: new Date().toISOString(),
     })
 
     if (!result.success) {
-      return withCORS(req, NextResponse.json({ ok: false, error: "Invalid signature" }, { status: 401 }))
+      return cors(req, NextResponse.json({ ok: false, error: "Invalid signature" }, { status: 401 }))
     }
 
-    // Session bauen (hier minimalistisch)
-    const session = JSON.stringify({
+    // --- Session bauen (minimal) ---
+    const sessionPayload = {
       address: siwe.address,
       iat: Date.now(),
-    })
-
+    }
     const res = NextResponse.json({ ok: true, address: siwe.address })
 
-    // Session setzen (7 Tage), Nonce invalidieren
-    res.cookies.set("tc_session", session, {
+    // --- Cookies setzen/löschen (Flags konsistent) ---
+    res.cookies.set("tc_session", JSON.stringify(sessionPayload), {
       httpOnly: true,
       sameSite: "lax",
-      secure: true,
+      secure: SECURE,
       path: "/",
-      maxAge: 60 * 60 * 24 * 7,
+      maxAge: 60 * 60 * 24 * 7, // 7 Tage
     })
+    // Nonce invalidieren (single-use)
     res.cookies.set("tc_nonce", "", {
       httpOnly: true,
       sameSite: "lax",
-      secure: true,
+      secure: SECURE,
       path: "/",
       maxAge: 0,
     })
 
-    return withCORS(req, res)
+    return cors(req, res)
   } catch (e: any) {
-    return withCORS(
+    return cors(
       req,
       NextResponse.json({ ok: false, error: e?.message || "Verify failed" }, { status: 500 })
     )
