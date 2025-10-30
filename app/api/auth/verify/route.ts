@@ -37,8 +37,8 @@ export async function POST(req: NextRequest) {
 
     setCookie(res, "tc_session", token, {
       httpOnly: true,
-      sameSite: "lax",
-      secure: undefined,
+      sameSite: "none",
+      secure: true,
       path: "/",
       maxAge: SESSION_TTL_SECONDS
     });
