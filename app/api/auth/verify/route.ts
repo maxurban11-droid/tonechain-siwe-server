@@ -1,7 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { withCors, handleOptions } from "@/utils/cors";
-import { keccak256 } from "viem";           // falls schon vorhanden
-import { recoverAddress, hashMessage } from "viem"; // oder ethers v5: utils.hashMessage / recoverAddress
+import { withCors, handleOptions } from "@/helpers/cors";
 
 export async function OPTIONS(req: NextRequest) {
   return handleOptions(req);
