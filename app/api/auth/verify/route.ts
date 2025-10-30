@@ -3,6 +3,12 @@ import { NextResponse } from "next/server"
 import { cookies, headers } from "next/headers"
 import { withCORS } from "@/helpers/cors"
 import { SiweMessage } from "siwe"
+import { cors } from "@/helpers/cors"     // dein shared CORS-Helper
+
+export async function OPTIONS(req: Request) {
+  // 204 + korrekte CORS-Header zurück
+  return cors(req, new Response(null, { status: 204 }))
+}
 
 export function OPTIONS(req: Request) {
   return withCORS(req, new NextResponse(null, { status: 204 }))
