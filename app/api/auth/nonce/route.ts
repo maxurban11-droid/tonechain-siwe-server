@@ -1,37 +1,43 @@
 // app/api/auth/nonce/route.ts
 import { NextResponse } from "next/server"
-import { withCORS } from "@/helpers/cors" // Pfad anpassen, falls kein baseUrl in tsconfig
-import { cors } from "@/helpers/cors"     // dein shared CORS-Helper
+import { cors, preflight } from "@/helpers/cors" // einheitlicher CORS-Helper
 
+// Secure Flag dynamisch: in Produktion true, lokal false
+const SECURE = process.env.NODE_ENV === "production"
+
+/** 
+ * OPTIONS – Preflight 
+ * Liefert 204 mit gültigen CORS-Headern
+ */
 export async function OPTIONS(req: Request) {
-  // 204 + korrekte CORS-Header zurück
-  return cors(req, new Response(null, { status: 204 }))
+  return preflight(req)
 }
 
+/** 
+ * Hilfsfunktion: kurze, kryptografisch starke Nonce erzeugen 
+ */
 function genNonce() {
-  // kurze, kryptografisch starke Nonce
   return Array.from(crypto.getRandomValues(new Uint8Array(16)))
     .map(b => b.toString(16).padStart(2, "0"))
     .join("")
 }
 
-// Für Preflight
-export function OPTIONS(req: Request) {
-  return withCORS(req, new NextResponse(null, { status: 204 }))
-}
-
-// Nonce holen (GET)
+/** 
+ * GET – neue Nonce generieren, httpOnly Cookie setzen
+ * Response: { nonce: "…" }
+ */
 export async function GET(req: Request) {
   const nonce = genNonce()
 
+  // Antwortkörper (JSON) + Cookie (httpOnly, 10 min)
   const res = NextResponse.json({ nonce })
-  // httpOnly Nonce-Cookie setzen (10 Min)
   res.cookies.set("tc_nonce", nonce, {
     httpOnly: true,
     sameSite: "lax",
-    secure: true,            // Vercel = HTTPS
+    secure: SECURE,
     path: "/",
-    maxAge: 60 * 10,
+    maxAge: 60 * 10, // 10 Minuten
   })
-  return withCORS(req, res)
+
+  return cors(req, res)
 }
