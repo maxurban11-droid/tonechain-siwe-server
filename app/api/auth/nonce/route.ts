@@ -1,6 +1,12 @@
 // app/api/auth/nonce/route.ts
 import { NextResponse } from "next/server"
 import { withCORS } from "@/helpers/cors" // Pfad anpassen, falls kein baseUrl in tsconfig
+import { cors } from "@/helpers/cors"     // dein shared CORS-Helper
+
+export async function OPTIONS(req: Request) {
+  // 204 + korrekte CORS-Header zurück
+  return cors(req, new Response(null, { status: 204 }))
+}
 
 function genNonce() {
   // kurze, kryptografisch starke Nonce
