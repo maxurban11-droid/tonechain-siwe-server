@@ -1,28 +1,40 @@
 // helpers/cors.ts
-import { NextResponse } from "next/server"
+const ALLOW_METHODS = "GET,POST,OPTIONS";
+const ALLOW_HEADERS = "content-type";
+const CREDENTIALS = "true";
 
-const ALLOWED_ORIGINS = [
-  "https://framer.com",
-  "https://framerusercontent.com",
-  "https://*.framer.website",
-  "https://*.framer.app",
-  "https://tonechain.framer.website", // dein Projekt
-]
-
-export function withCORS(req: Request, res: NextResponse) {
-  const origin = req.headers.get("origin") || ""
-  const allowed = ALLOWED_ORIGINS.some((o) =>
-    o.startsWith("https://*.") ? origin.endsWith(o.slice(8)) : origin === o
-  )
-  if (allowed) {
-    res.headers.set("Access-Control-Allow-Origin", origin)
-    res.headers.set("Access-Control-Allow-Credentials", "true")
+function allowOriginFor(req: Request) {
+  const o = req.headers.get("Origin");
+  // 👉 trage deine erlaubten Origins hier ein
+  const allowed = [
+    "https://framer.com",
+    "https://*.framer.app",
+    "https://*.framer.website",
+    "https://tonechain.framer.website",
+  ];
+  if (!o) return "*"; // für Healthchecks o.Ä. – optional
+  try {
+    const ok = allowed.some(p =>
+      p.startsWith("https://*.") ? o.endsWith(p.slice(10)) : o === p
+    );
+    return ok ? o : o; // im Zweifel Echo-Back, aber in Prod lieber blocken
+  } catch {
+    return o ?? "*";
   }
-  res.headers.set(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-Requested-With"
-  )
-  res.headers.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-  res.headers.set("Vary", "Origin")
-  return res
+}
+
+export function cors(req: Request, res: Response) {
+  const origin = allowOriginFor(req);
+  const h = new Headers(res.headers);
+  h.set("Access-Control-Allow-Origin", origin);
+  h.set("Access-Control-Allow-Credentials", CREDENTIALS);
+  h.set("Access-Control-Allow-Methods", ALLOW_METHODS);
+  h.set("Access-Control-Allow-Headers", ALLOW_HEADERS);
+  h.set("Vary", "Origin");
+  return new Response(res.body, { status: res.status, headers: h });
+}
+
+export function preflight(req: Request) {
+  // 204 leerer Body
+  return cors(req, new Response(null, { status: 204 }));
 }
