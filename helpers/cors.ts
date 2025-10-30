@@ -1,4 +1,4 @@
-// helpers/cors.ts — CORS-Helper, kompatibel mit Cookies (credentials: "include")
+// helpers/cors.ts — CORS-Helper, kompatibel mit credentials (Cookies)
 
 const DEFAULT_WHITELIST: RegExp[] = [
   /^https?:\/\/localhost(:\d+)?$/i,
@@ -10,18 +10,15 @@ const DEFAULT_WHITELIST: RegExp[] = [
   /^https:\/\/(www\.)?tonechain\.app$/i,
 ];
 
-// Optional: zusätzliche Origins per ENV, komma-getrennt, Wildcards erlaubt (z.B. "*.dein-domain.tld")
+// Optional: weitere Origins per ENV (Komma-getrennt, Wildcards via *)
 function envWhitelist(): RegExp[] {
   const raw = process.env.ALLOWED_ORIGINS || "";
   return raw
     .split(",")
     .map(s => s.trim())
     .filter(Boolean)
-    .map((pat) => {
-      // "*.foo.bar" -> /^https:\/\/.*\.foo\.bar$/i
-      const esc = pat
-        .replace(/\./g, "\\.")
-        .replace(/\*/g, ".*");
+    .map(pat => {
+      const esc = pat.replace(/\./g, "\\.").replace(/\*/g, ".*");
       return new RegExp(`^https?:\/\/${esc}$`, "i");
     });
 }
@@ -46,12 +43,10 @@ export function cors(req: Request, res: Response, opts: CorsOpts = {}): Response
 
   if (allowed) {
     h.set("Access-Control-Allow-Origin", allowed);
-    h.append("Vary", "Origin"); // wichtig für richtige CDN-Caching-Variante
+    h.append("Vary", "Origin");
     h.set("Access-Control-Allow-Credentials", "true");
-  } else {
-    // Keine Wildcard verwenden, wenn Credentials beteiligt sind!
-    // Wenn Origin nicht whitelisted ist: lieber gar keinen ACAO-Header setzen.
   }
+  // Keine Wildcard setzen, wenn credentials im Spiel sind.
 
   h.set("Access-Control-Allow-Methods", (opts.methods ?? ["GET", "POST", "OPTIONS"]).join(","));
   h.set(
@@ -64,6 +59,6 @@ export function cors(req: Request, res: Response, opts: CorsOpts = {}): Response
 }
 
 export function preflight(req: Request, opts?: CorsOpts): Response {
-  // 204 ohne Body, aber mit CORS-Headern
+  // 204 ohne Body, aber mit vollen CORS-Headern
   return cors(req, new Response(null, { status: 204 }), opts);
 }
