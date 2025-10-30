@@ -1,0 +1,1 @@
+// legacy api/nonce.js moved here – disabled

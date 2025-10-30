@@ -1,0 +1,1 @@
+// legacy api/verify.js moved here – disabled
