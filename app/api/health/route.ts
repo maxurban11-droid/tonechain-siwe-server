@@ -1,11 +1,11 @@
-import { NextResponse, type NextRequest } from "next/server";
-import { withCors, handleOptions } from "@/helpers/cors";
+// app/api/health/route.ts
+import { NextResponse } from "next/server"
+import { withCORS } from "@/helpers/cors"
 
-export async function OPTIONS(req: NextRequest) {
-  return handleOptions(req);
+export function OPTIONS(req: Request) {
+  return withCORS(req, new NextResponse(null, { status: 204 }))
 }
 
-export async function GET(req: NextRequest) {
-  const res = NextResponse.json({ ok: true, ts: Date.now() }, { status: 200 });
-  return withCors(req, res);
+export async function GET(req: Request) {
+  return withCORS(req, NextResponse.json({ status: "ok" }))
 }
