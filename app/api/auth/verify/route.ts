@@ -1,52 +1,76 @@
-import { NextResponse, type NextRequest } from "next/server";
-import { withCors, handleOptions } from "@/helpers/cors";
-import { clearCookie, setCookie } from "@/helpers/cookies";
-import { SESSION_TTL_SECONDS } from "@/helpers/env";
-import { SiweMessage } from "siwe";
-import { createSessionToken } from "@/helpers/crypto";
+// app/api/auth/verify/route.ts
+import { NextResponse } from "next/server"
+import { cookies, headers } from "next/headers"
+import { withCORS } from "@/helpers/cors"
+import { SiweMessage } from "siwe"
 
-export async function OPTIONS(req: NextRequest) {
-  return handleOptions(req);
+export function OPTIONS(req: Request) {
+  return withCORS(req, new NextResponse(null, { status: 204 }))
 }
 
-export async function POST(req: NextRequest) {
+type Body = { message: string; signature: string }
+
+export async function POST(req: Request) {
   try {
-    const body = await req.json().catch(() => ({}));
-    const { message, signature } = body || {};
+    const { message, signature } = (await req.json()) as Body
     if (!message || !signature) {
-      const r = NextResponse.json({ ok: false, error: "Missing message or signature" }, { status: 400 });
-      return withCors(req, r);
+      return withCORS(req, NextResponse.json({ ok: false, error: "Bad payload" }, { status: 400 }))
     }
 
-    const cookieNonce = req.cookies.get("tc_nonce")?.value || null;
-    if (!cookieNonce) {
-      const r = NextResponse.json({ ok: false, error: "Nonce cookie missing or expired" }, { status: 400 });
-      return withCors(req, r);
+    // Nonce aus httpOnly-Cookie lesen
+    const nonceCookie = cookies().get("tc_nonce")?.value
+    if (!nonceCookie) {
+      return withCORS(req, NextResponse.json({ ok: false, error: "Missing nonce" }, { status: 400 }))
     }
 
-    const siwe = new SiweMessage(message);
-    const fields = await siwe.verify({ signature, nonce: cookieNonce });
-    if (!fields.success) {
-      const r = NextResponse.json({ ok: false, error: "Invalid SIWE" }, { status: 401 });
-      return withCors(req, r);
+    // Domain/Origin optional streng prüfen
+    const hdrs = headers()
+    const host = hdrs.get("host") || ""
+    const origin = hdrs.get("origin") || ""
+    const domain = host.split(":")[0]
+
+    // SIWE prüfen
+    const siwe = new SiweMessage(message)
+    const result = await siwe.verify({
+      signature,
+      nonce: nonceCookie,
+      domain,                    // stellt sicher, dass die Message für diese Domain ist
+      time: new Date().toISOString(),
+    })
+
+    if (!result.success) {
+      return withCORS(req, NextResponse.json({ ok: false, error: "Invalid signature" }, { status: 401 }))
     }
 
-    const address = siwe.address;
-    const token = createSessionToken(address);
-    const res = NextResponse.json({ ok: true, address }, { status: 200 });
+    // Session bauen (hier minimalistisch)
+    const session = JSON.stringify({
+      address: siwe.address,
+      iat: Date.now(),
+    })
 
-    setCookie(res, "tc_session", token, {
+    const res = NextResponse.json({ ok: true, address: siwe.address })
+
+    // Session setzen (7 Tage), Nonce invalidieren
+    res.cookies.set("tc_session", session, {
       httpOnly: true,
       sameSite: "lax",
-      secure: undefined,
+      secure: true,
       path: "/",
-      maxAge: SESSION_TTL_SECONDS
-    });
-    clearCookie(res, "tc_nonce", { httpOnly: true, sameSite: "lax", path: "/" });
+      maxAge: 60 * 60 * 24 * 7,
+    })
+    res.cookies.set("tc_nonce", "", {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: true,
+      path: "/",
+      maxAge: 0,
+    })
 
-    return withCors(req, res);
+    return withCORS(req, res)
   } catch (e: any) {
-    const r = NextResponse.json({ ok: false, error: e?.message || "Verify failed" }, { status: 500 });
-    return withCors(req, r);
+    return withCORS(
+      req,
+      NextResponse.json({ ok: false, error: e?.message || "Verify failed" }, { status: 500 })
+    )
   }
 }
