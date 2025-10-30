@@ -4,16 +4,15 @@ import { cors, preflight } from "@/helpers/cors"
 
 const SECURE = process.env.NODE_ENV === "production"
 
-/** OPTIONS – Preflight (204 + CORS-Header) */
+/** OPTIONS – preflight */
 export async function OPTIONS(req: Request) {
   return preflight(req)
 }
 
-/** POST – Session-Cookie invalidieren */
+/** POST – clear session cookie */
 export async function POST(req: Request) {
   const res = NextResponse.json({ ok: true })
 
-  // tc_session löschen
   res.cookies.set("tc_session", "", {
     httpOnly: true,
     sameSite: "lax",
@@ -21,8 +20,7 @@ export async function POST(req: Request) {
     path: "/",
     maxAge: 0,
   })
-
-  // optional: übrig gebliebene Nonce ebenfalls invalidieren
+  // also clear leftover nonce
   res.cookies.set("tc_nonce", "", {
     httpOnly: true,
     sameSite: "lax",
