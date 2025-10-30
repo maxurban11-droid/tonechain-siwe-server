@@ -3,6 +3,8 @@ import { cookies, headers } from "next/headers"
 import { cors, preflight } from "@/helpers/cors"
 import { SiweMessage } from "siwe"
 
+export const dynamic = "force-dynamic"
+
 type Body = { message: string; signature: string }
 
 export function OPTIONS(req: Request) {
@@ -37,17 +39,30 @@ export async function POST(req: Request) {
     }
 
     const session = JSON.stringify({ address: siwe.address, iat: Date.now() })
+
     const res = NextResponse.json({ ok: true, address: siwe.address })
 
+    // *** Cross-site kompatibel ***
     res.cookies.set("tc_session", session, {
-      httpOnly: true, sameSite: "lax", secure: true, path: "/", maxAge: 60 * 60 * 24 * 7,
+      httpOnly: true,
+      sameSite: "none",  // <— WICHTIG für Framer (cross-site)
+      secure: true,
+      path: "/",
+      maxAge: 60 * 60 * 24 * 7,
     })
     res.cookies.set("tc_nonce", "", {
-      httpOnly: true, sameSite: "lax", secure: true, path: "/", maxAge: 0,
+      httpOnly: true,
+      sameSite: "none",
+      secure: true,
+      path: "/",
+      maxAge: 0,
     })
 
     return cors(req, res)
   } catch (e: any) {
-    return cors(req, NextResponse.json({ ok: false, error: e?.message || "Verify failed" }, { status: 500 }))
+    return cors(
+      req,
+      NextResponse.json({ ok: false, error: e?.message || "Verify failed" }, { status: 500 })
+    )
   }
 }
