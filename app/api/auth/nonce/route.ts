@@ -18,8 +18,8 @@ export async function GET(req: NextRequest) {
   const res = NextResponse.json({ nonce }, { status: 200 });
   setCookie(res, "tc_nonce", nonce, {
     httpOnly: true,
-    sameSite: "lax",
-    secure: undefined,
+    sameSite: "none",
+    secure: true,
     path: "/",
     maxAge: NONCE_TTL_SECONDS
   });
