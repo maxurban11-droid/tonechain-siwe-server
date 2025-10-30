@@ -1,11 +1,12 @@
-// app/api/health/route.ts
 import { NextResponse } from "next/server"
-import { withCORS } from "@/helpers/cors"
+import { cors, preflight } from "@/helpers/cors"
+
+export const dynamic = "force-dynamic"
 
 export function OPTIONS(req: Request) {
-  return withCORS(req, new NextResponse(null, { status: 204 }))
+  return preflight(req)
 }
 
-export async function GET(req: Request) {
-  return withCORS(req, NextResponse.json({ status: "ok" }))
+export function GET(req: Request) {
+  return cors(req, NextResponse.json({ status: "ok" }))
 }
