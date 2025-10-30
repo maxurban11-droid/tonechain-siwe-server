@@ -2,6 +2,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { withCors, handleOptions } from "@/helpers/cors";
 import { setCookie } from "@/helpers/cookies";
 import { NONCE_TTL_SECONDS } from "@/helpers/env";
+import type { NextRequest } from "next/server";
 
 function makeNonce() {
   const arr = new Uint8Array(24);
