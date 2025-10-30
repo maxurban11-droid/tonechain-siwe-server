@@ -1,40 +1,28 @@
 // helpers/cors.ts
-const ALLOW_METHODS = "GET,POST,OPTIONS";
-const ALLOW_HEADERS = "content-type";
-const CREDENTIALS = "true";
+import type { NextResponse } from "next/server"
+import { NextResponse as NR } from "next/server"
 
-function allowOriginFor(req: Request) {
-  const o = req.headers.get("Origin");
-  // 👉 trage deine erlaubten Origins hier ein
-  const allowed = [
-    "https://framer.com",
-    "https://*.framer.app",
-    "https://*.framer.website",
-    "https://tonechain.framer.website",
-  ];
-  if (!o) return "*"; // für Healthchecks o.Ä. – optional
-  try {
-    const ok = allowed.some(p =>
-      p.startsWith("https://*.") ? o.endsWith(p.slice(10)) : o === p
-    );
-    return ok ? o : o; // im Zweifel Echo-Back, aber in Prod lieber blocken
-  } catch {
-    return o ?? "*";
-  }
+const ORIGIN = process.env.CORS_ORIGIN || "*"
+// In Prod you can set CORS_ORIGIN="https://your-framer-site.framer.website" (or your custom domain)
+
+function apply(res: NextResponse, origin: string) {
+  res.headers.set("Access-Control-Allow-Origin", origin)
+  res.headers.set("Vary", "Origin")
+  res.headers.set("Access-Control-Allow-Credentials", "true")
+  res.headers.set(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, X-Requested-With"
+  )
+  res.headers.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+  return res
 }
 
-export function cors(req: Request, res: Response) {
-  const origin = allowOriginFor(req);
-  const h = new Headers(res.headers);
-  h.set("Access-Control-Allow-Origin", origin);
-  h.set("Access-Control-Allow-Credentials", CREDENTIALS);
-  h.set("Access-Control-Allow-Methods", ALLOW_METHODS);
-  h.set("Access-Control-Allow-Headers", ALLOW_HEADERS);
-  h.set("Vary", "Origin");
-  return new Response(res.body, { status: res.status, headers: h });
+/** Attach CORS headers to any response */
+export function cors(_req: Request, res: NextResponse, origin = ORIGIN) {
+  return apply(res, origin)
 }
 
-export function preflight(req: Request) {
-  // 204 leerer Body
-  return cors(req, new Response(null, { status: 204 }));
+/** Return a 204 preflight with CORS headers */
+export async function preflight(_req: Request, origin = ORIGIN) {
+  return apply(new NR(null, { status: 204 }), origin)
 }
