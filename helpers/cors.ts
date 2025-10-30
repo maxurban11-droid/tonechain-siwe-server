@@ -3,7 +3,7 @@ import type { NextResponse } from "next/server"
 import { NextResponse as NR } from "next/server"
 
 const ORIGIN = process.env.CORS_ORIGIN || "*"
-// In Prod you can set CORS_ORIGIN="https://your-framer-site.framer.website" (or your custom domain)
+// In Prod sinnvoll: CORS_ORIGIN="https://deine-domain.xyz" setzen
 
 function apply(res: NextResponse, origin: string) {
   res.headers.set("Access-Control-Allow-Origin", origin)
@@ -25,4 +25,9 @@ export function cors(_req: Request, res: NextResponse, origin = ORIGIN) {
 /** Return a 204 preflight with CORS headers */
 export async function preflight(_req: Request, origin = ORIGIN) {
   return apply(new NR(null, { status: 204 }), origin)
+}
+
+/** 🔁 Kompatibilitäts-Alias für bestehenden Code */
+export function withCORS(req: Request, res: NextResponse) {
+  return cors(req, res)
 }
