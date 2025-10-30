@@ -42,7 +42,7 @@ export async function POST(req: NextRequest) {
       path: "/",
       maxAge: SESSION_TTL_SECONDS
     });
-    clearCookie(res, "tc_nonce", { httpOnly: true, sameSite: "lax", path: "/" });
+    clearCookie(res, "tc_nonce", { httpOnly: true, sameSite: "none", secure: true, path: "/" });
 
     return withCors(req, res);
   } catch (e: any) {
