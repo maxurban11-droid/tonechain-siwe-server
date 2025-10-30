@@ -8,7 +8,7 @@ export async function OPTIONS(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
   const res = NextResponse.json({ ok: true }, { status: 200 });
-  clearCookie(res, "tc_session", { httpOnly: true, sameSite: "lax", path: "/" });
-  clearCookie(res, "tc_nonce", { httpOnly: true, sameSite: "lax", path: "/" });
+  clearCookie(res, "tc_session", { httpOnly: true, sameSite: "none", secure: true, path: "/" });
+  clearCookie(res, "tc_nonce",   { httpOnly: true, sameSite: "none", secure: true, path: "/" });
   return withCors(req, res);
 }
