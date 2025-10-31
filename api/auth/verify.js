@@ -1,6 +1,5 @@
-// api/auth/verify.js — prüft SIWE-Signatur + setzt Session-Cookie
+// api/auth/verify.js — CORS-first + lazy require to not break OPTIONS
 const crypto = require("crypto");
-const { ethers } = require("ethers");
 
 function setCors(req, res) {
   const origin = req.headers.origin || "";
@@ -28,12 +27,13 @@ function setCookie(res, name, value, maxAgeSec) {
     `Max-Age=${maxAgeSec}`,
     "HttpOnly",
     "SameSite=None",
-    "Secure"
+    "Secure",
   ];
   res.setHeader("Set-Cookie", parts.join("; "));
 }
 
 module.exports = async (req, res) => {
+  // CORS headers always first so preflight never fails
   setCors(req, res);
 
   if (req.method === "OPTIONS") return res.status(204).end();
@@ -45,15 +45,29 @@ module.exports = async (req, res) => {
     if (!message || !signature)
       return res.status(400).json({ ok: false, error: "Missing params" });
 
+    // ⬇️ lazy require so OPTIONS works even if ethers isn't installed
+    let ethers;
+    try {
+      ethers = require("ethers");
+    } catch (e) {
+      // Keep CORS ok but be explicit about the cause
+      return res.status(500).json({
+        ok: false,
+        error:
+          "Server missing dependency 'ethers'. (Install it or switch to a no-deps verifier.)",
+      });
+    }
+
     const addr = ethers.utils.verifyMessage(message, signature);
     if (!addr)
-      return res.status(400).json({ ok: false, error: "Invalid signature" });
+      return res
+        .status(400)
+        .json({ ok: false, error: "Invalid signature" });
 
-    // Session-Token (8 Std gültig)
-    const token = crypto.randomBytes(20).toString("hex");
+    const token = crypto.randomBytes(20).toString("hex"); // 8h Session
     setCookie(res, "tc_session", token, 60 * 60 * 8);
-
     clearCookie(res, "tc_nonce");
+
     return res.status(200).json({ ok: true, address: addr });
   } catch (err) {
     console.error("Verify failed:", err);
