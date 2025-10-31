@@ -2,6 +2,15 @@
 const { withCors, handleOptions } = require("../../helpers/cors.js");
 const crypto = require("crypto");
 
+export default async function handler(req, res) {
+  if (req.method === "OPTIONS") return handleOptions(req, res); // Preflight
+
+  await withCors(req, res); // <- MUSS vor der Antwort passieren
+
+  if (req.method !== "POST") {
+    return res.status(405).json({ ok: false, error: "Method not allowed" });
+  }
+
 module.exports = async (req, res) => {
   if (req.method === "OPTIONS") return handleOptions(req, res);
   await withCors(req, res);
