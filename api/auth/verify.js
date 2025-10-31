@@ -1,92 +1,60 @@
-// api/auth/verify.js — robuste Validierung + 400 bei ungültiger Signatur
-const crypto = require("crypto");
-
-function setCors(req, res) {
-  const origin = req.headers.origin || "";
-  if (origin) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Vary", "Origin");
-    res.setHeader("Access-Control-Allow-Credentials", "true");
-  }
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
-  res.setHeader("Access-Control-Max-Age", "86400");
-}
-
-function clearCookie(res, name) {
-  res.setHeader(
-    "Set-Cookie",
-    `${name}=; Path=/; Max-Age=0; HttpOnly; SameSite=None; Secure`
-  );
-}
-
-function setCookie(res, name, value, maxAgeSec) {
-  const parts = [
-    `${name}=${value}`,
-    "Path=/",
-    `Max-Age=${maxAgeSec}`,
-    "HttpOnly",
-    "SameSite=None",
-    "Secure",
-  ];
-  res.setHeader("Set-Cookie", parts.join("; "));
-}
+// api/auth/verify.js
+const { withCors, handleOptions } = require("../../helpers/cors.js");
+const { verifyMessage } = require("@ethersproject/wallet"); // ethers v5
+const { splitSignature } = require("@ethersproject/bytes");
 
 module.exports = async (req, res) => {
-  setCors(req, res);
+  if (req.method === "OPTIONS") return handleOptions(req, res);
+  await withCors(req, res);
 
-  if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method !== "POST")
+  if (req.method !== "POST") {
     return res.status(405).json({ ok: false, error: "Method Not Allowed" });
-
-  try {
-    // Body sicher lesen
-    let body = req.body;
-    if (typeof body === "string") {
-      try { body = JSON.parse(body); }
-      catch { return res.status(400).json({ ok: false, error: "Invalid JSON body" }); }
-    }
-
-    const message = body?.message;
-    const signature = body?.signature;
-
-    if (typeof message !== "string" || typeof signature !== "string") {
-      return res.status(400).json({ ok: false, error: "Missing params (message, signature)" });
-    }
-
-    // Grobformat prüfen (0x + mind. 65 Bytes)
-    const hexRe = /^0x[0-9a-fA-F]+$/;
-    if (!hexRe.test(signature) || signature.length < 132) {
-      return res.status(400).json({ ok: false, error: "Invalid signature format" });
-    }
-
-    // Lazy require, damit OPTIONS nie bricht
-    let ethers;
-    try {
-      ethers = require("ethers");
-    } catch {
-      return res.status(500).json({ ok: false, error: "Server missing dependency 'ethers'." });
-    }
-
-    let addr;
-    try {
-      addr = ethers.utils.verifyMessage(message, signature);
-    } catch (e) {
-      // Alle verify-Fehler → 400 zurückgeben (kein 500)
-      return res.status(400).json({ ok: false, error: "Invalid signature" });
-    }
-
-    if (!addr) return res.status(400).json({ ok: false, error: "Invalid signature" });
-
-    // Session 8h setzen, Nonce löschen
-    const token = crypto.randomBytes(20).toString("hex");
-    setCookie(res, "tc_session", token, 60 * 60 * 8);
-    clearCookie(res, "tc_nonce");
-
-    return res.status(200).json({ ok: true, address: addr });
-  } catch (err) {
-    // Nur echte Serverfehler hier landen
-    console.error("Verify failed (unexpected):", err);
-    return res.status(500).json({ ok: false, error: "Server error" });
   }
+
+  // Body
+  let body = {};
+  try {
+    body = typeof req.body === "string" ? JSON.parse(req.body) : req.body || {};
+  } catch {
+    return res.status(400).json({ ok: false, error: "Invalid JSON" });
+  }
+  const { message, signature } = body || {};
+  if (!message || !signature) {
+    return res.status(400).json({ ok: false, error: "Missing message/signature" });
+  }
+
+  // Nonce aus httpOnly Cookie
+  const cookie = String(req.headers.cookie || "");
+  const nonce = (cookie.match(/(?:^|;\s*)tc_nonce=([^;]+)/) || [])[1];
+  if (!nonce) return res.status(400).json({ ok: false, error: "Nonce cookie missing or expired" });
+
+  // Nonce im SIWE-Text prüfen (einfacher Check)
+  if (!message.includes(`Nonce: ${nonce}`)) {
+    return res.status(400).json({ ok: false, error: "Nonce mismatch" });
+  }
+
+  // Signaturformat prüfen (wirft bei ungültigen Werten)
+  try { splitSignature(signature); } catch {
+    return res.status(400).json({ ok: false, error: "Invalid signature format" });
+  }
+
+  // Signatur verifizieren
+  let recovered;
+  try {
+    recovered = verifyMessage(message, signature);
+  } catch (e) {
+    return res.status(400).json({ ok: false, error: `Verify failed` });
+  }
+
+  // Session-Cookie setzen & Nonce löschen
+  const session = Buffer.from(
+    JSON.stringify({ a: recovered, t: Date.now() })
+  ).toString("base64url");
+
+  res.setHeader("Set-Cookie", [
+    "tc_nonce=; Path=/; Max-Age=0; HttpOnly; SameSite=None; Secure",
+    `tc_session=${session}; Path=/; Max-Age=${60 * 60 * 24 * 7}; HttpOnly; SameSite=None; Secure`
+  ]);
+
+  return res.status(200).json({ ok: true, address: recovered });
 };
