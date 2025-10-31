@@ -1,4 +1,7 @@
 {
   "name": "tonechain-siwe-server",
-  "private": true
+  "private": true,
+  "dependencies": {
+    "ethers": "5.7.2"
+  }
 }
