@@ -1,4 +1,4 @@
-// api/ping.js — Plain JS, kein Build/TS nötig
+// api/ping.js — Plain JS, kein TS/Build nötig
 module.exports = (req, res) => {
   if (req.method === 'OPTIONS') {
     res.setHeader('Access-Control-Allow-Origin', '*');
