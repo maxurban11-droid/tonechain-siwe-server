@@ -1,12 +1,14 @@
 // helpers/cors.js
 const ORIGIN_WHITELIST = [
-  // exakte Domain deiner Framer-Site:
-  "https://concave-device-193297.framer.app",
-  // optional Dev:
-  "http://localhost:3000",
-  // Wildcard für Framer-Previews (optional, vorsichtig einsetzen)
-  "https://*.framer.app",
-];
+   // deine veröffentlichte Framer-Site:
+   "https://concave-device-193297.framer.app",
+   // Framer Editor / Live Preview:
+   "https://framer.com",
+   "https://*.framer.app",
+   "https://*.framer.website",
+   // Lokal
+   "http://localhost:3000",
+ ];
 
 function isAllowed(origin) {
   if (!origin) return null;
