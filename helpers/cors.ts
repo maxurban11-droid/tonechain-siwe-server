@@ -1,53 +1,46 @@
 // helpers/cors.js
-const ORIGIN_WHITELIST = [
-   // deine veröffentlichte Framer-Site:
-   "https://concave-device-193297.framer.app",
-   // Framer Editor / Live Preview:
-   "https://framer.com",
-   "https://*.framer.app",
-   "https://*.framer.website",
-   // Lokal
-   "http://localhost:3000",
- ];
+// Zentrale CORS-Helper für alle API-Routen (Vercel Serverless, Node/Express-Style)
 
-function isAllowed(origin) {
-  if (!origin) return null;
-  const o = origin.replace(/\/+$/, "").toLowerCase();
-  for (const entryRaw of ORIGIN_WHITELIST) {
-    const entry = String(entryRaw).replace(/\/+$/, "").toLowerCase();
-    if (!entry.includes("*")) {
-      if (o === entry) return o;
-      continue;
-    }
-    // nur Subdomain-Wildcard (*.domain.tld)
-    const esc = entry
-      .replace(/[-/\\^$+?.()|[\]{}]/g, "\\$&")
-      .replace(/\\\*\\\./g, "(?:[a-z0-9-]+\\.)+");
-    const re = new RegExp(`^${esc}$`, "i");
-    if (re.test(o)) return o;
-  }
-  return null;
+const ALLOWED = (process.env.CORS_ORIGIN || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
+// Gibt die erlaubte Origin (oder leeren String) zurück
+function pickOrigin(req) {
+  const o = req.headers.origin || "";
+  if (!o) return "";
+  if (ALLOWED.length === 0) return "";               // nichts erlaubt
+  if (ALLOWED.includes(o)) return o;                 // exakte Übereinstimmung
+  return "";                                         // nicht erlaubt
 }
 
-async function withCors(req, res) {
-  const allowed = isAllowed(req.headers.origin || "");
-  if (allowed) {
-    res.setHeader("Access-Control-Allow-Origin", allowed);
-    res.setHeader("Vary", "Origin");
-    res.setHeader("Access-Control-Allow-Credentials", "true");
-  }
+// setzt CORS-Header (bei erlaubter Origin)
+function applyCors(req, res) {
+  const origin = pickOrigin(req);
+  if (!origin) return;                               // keine ACAO Header setzen
+
+  // wichtig für Cache-Vary & Cookies
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Origin", origin);
+  res.setHeader("Access-Control-Allow-Credentials", "true");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type,Authorization,Accept,X-Requested-With"
-  );
-  res.setHeader("Access-Control-Max-Age", "86400");
-  return res;
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
 }
 
+// beantwortet Preflight
 function handleOptions(req, res) {
-  withCors(req, res);
-  return res.status(204).end();
+  applyCors(req, res);
+  res.status(204).end();
+}
+
+// Wrapper für deine Routen
+function withCors(handler) {
+  return async (req, res) => {
+    if (req.method === "OPTIONS") return handleOptions(req, res);
+    applyCors(req, res);
+    return handler(req, res);
+  };
 }
 
 module.exports = { withCors, handleOptions };
