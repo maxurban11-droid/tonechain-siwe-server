@@ -1,6 +1,6 @@
 // helpers/cors.ts
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { ORIGIN_WHITELIST } from "./env";
+import { ORIGIN_WHITELIST } from "./env.js";
 
 function allowOrigin(origin: string | undefined): string | null {
   if (!origin) return null;
