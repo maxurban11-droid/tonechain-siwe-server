@@ -1,8 +1,8 @@
 // api/auth/verify.ts
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { withCors, handleOptions } from "../../helpers/cors";
-import { setCookie, clearCookie } from "../../helpers/cookies";
-import { verifyPersonalSign } from "../../utils/siwe";
+import { withCors, handleOptions } from "../../helpers/cors.js";
+import { setCookie, clearCookie } from "../../helpers/cookies.js";
+import { verifyPersonalSign } from "../../utils/siwe.js";
 
 const COOKIE_NONCE = "tc_nonce";
 const COOKIE_SESSION = "tc_session";
