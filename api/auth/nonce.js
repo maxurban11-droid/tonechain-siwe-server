@@ -1,32 +1,53 @@
 // api/auth/nonce.js
-const { withCors, handleOptions } = require("../../helpers/cors.js");
-const crypto = require("crypto");
-
 export default async function handler(req, res) {
-  if (req.method === "OPTIONS") return handleOptions(req, res); // Preflight
+  // --- CORS / Preflight ---
+  if (req.method === "OPTIONS") {
+    res.setHeader("Access-Control-Allow-Origin", req.headers.origin || "*");
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+    res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    return res.status(204).end();
+  }
 
-  await withCors(req, res); // <- MUSS vor der Antwort passieren
+  // --- CORS für eigentliche Antwort ---
+  res.setHeader("Access-Control-Allow-Origin", req.headers.origin || "*");
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Credentials", "true");
 
   if (req.method !== "POST") {
     return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
 
-module.exports = async (req, res) => {
-  if (req.method === "OPTIONS") return handleOptions(req, res);
-  await withCors(req, res);
-
-  if (req.method !== "POST" && req.method !== "GET") {
-    return res.status(405).json({ ok: false, error: "Method Not Allowed" });
+  // --- Nonce erzeugen ---
+  let nonce;
+  try {
+    nonce =
+      globalThis.crypto?.randomUUID?.() ||
+      require("crypto").randomBytes(16).toString("hex");
+  } catch {
+    // Fallback falls require nicht geht (ESM)
+    const arr = new Uint8Array(16);
+    (globalThis.crypto || window.crypto).getRandomValues(arr);
+    nonce = Array.from(arr).map(b => b.toString(16).padStart(2, "0")).join("");
   }
 
-  // Nonce generieren
-  const nonce = crypto.randomBytes(16).toString("hex");
+  // --- httpOnly Cookie setzen (10 Minuten) ---
+  const maxAge = 60 * 10;
+  const isProd =
+    process.env.VERCEL_ENV === "production" ||
+    process.env.NODE_ENV === "production";
 
-  // httpOnly Cookie setzen – 10 Minuten
-  res.setHeader(
-    "Set-Cookie",
-    `tc_nonce=${nonce}; Path=/; Max-Age=${60 * 10}; HttpOnly; SameSite=None; Secure`
-  );
+  const cookieParts = [
+    `tc_nonce=${nonce}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Lax",
+    `Max-Age=${maxAge}`,
+    isProd ? "Secure" : null,
+  ].filter(Boolean);
+
+  res.setHeader("Set-Cookie", cookieParts.join("; "));
 
   return res.status(200).json({ ok: true, nonce });
-};
+}
