@@ -3,9 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "engines": {
-    "node": ">=18.17.0"
-  },
+  "engines": { "node": ">=20 <21" }
   "dependencies": {
     "ethers": "^6.12.1"
   },
