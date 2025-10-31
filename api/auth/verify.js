@@ -1,4 +1,4 @@
-// api/auth/verify.js — CORS-first + lazy require to not break OPTIONS
+// api/auth/verify.js — robuste Eingangsvalidierung + 400 bei ungültiger Signatur
 const crypto = require("crypto");
 
 function setCors(req, res) {
@@ -33,7 +33,6 @@ function setCookie(res, name, value, maxAgeSec) {
 }
 
 module.exports = async (req, res) => {
-  // CORS headers always first so preflight never fails
   setCors(req, res);
 
   if (req.method === "OPTIONS") return res.status(204).end();
@@ -41,30 +40,64 @@ module.exports = async (req, res) => {
     return res.status(405).json({ ok: false, error: "Method Not Allowed" });
 
   try {
-    const { message, signature } = req.body || {};
-    if (!message || !signature)
-      return res.status(400).json({ ok: false, error: "Missing params" });
+    // Body sicher lesen (Vercel liefert meist schon JSON-Objekt)
+    let body = req.body;
+    if (typeof body === "string") {
+      try {
+        body = JSON.parse(body);
+      } catch {
+        return res
+          .status(400)
+          .json({ ok: false, error: "Invalid JSON body" });
+      }
+    }
 
-    // ⬇️ lazy require so OPTIONS works even if ethers isn't installed
+    const message = body?.message;
+    const signature = body?.signature;
+
+    if (typeof message !== "string" || typeof signature !== "string") {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Missing params (message, signature)" });
+    }
+
+    // einfache Signatur-Validierung (65-Byte, 0x-prefixed)
+    const hexRe = /^0x[0-9a-fA-F]+$/;
+    if (!hexRe.test(signature) || signature.length < 132) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Invalid signature format" });
+    }
+
+    // lazy require, damit OPTIONS nie bricht
     let ethers;
     try {
       ethers = require("ethers");
-    } catch (e) {
-      // Keep CORS ok but be explicit about the cause
+    } catch {
       return res.status(500).json({
         ok: false,
-        error:
-          "Server missing dependency 'ethers'. (Install it or switch to a no-deps verifier.)",
+        error: "Server missing dependency 'ethers'.",
       });
     }
 
-    const addr = ethers.utils.verifyMessage(message, signature);
-    if (!addr)
+    let addr;
+    try {
+      addr = ethers.utils.verifyMessage(message, signature);
+    } catch (e) {
+      // z. B. "bad signature" etc. → 400, nicht 500
       return res
         .status(400)
         .json({ ok: false, error: "Invalid signature" });
+    }
 
-    const token = crypto.randomBytes(20).toString("hex"); // 8h Session
+    if (!addr) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Invalid signature" });
+    }
+
+    // Session 8h
+    const token = crypto.randomBytes(20).toString("hex");
     setCookie(res, "tc_session", token, 60 * 60 * 8);
     clearCookie(res, "tc_nonce");
 
