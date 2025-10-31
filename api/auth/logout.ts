@@ -1,7 +1,7 @@
 // api/auth/logout.ts
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { withCors, handleOptions } from "../../helpers/cors";
-import { clearCookie } from "../../helpers/cookies";
+import { withCors, handleOptions } from "../../helpers/cors.js";
+import { clearCookie } from "../../helpers/cookies.js";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method === "OPTIONS") return handleOptions(req, res);
