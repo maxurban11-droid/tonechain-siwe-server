@@ -1,7 +1,7 @@
 // api/auth/nonce.ts
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { withCors, handleOptions } from "../../helpers/cors";
-import { setCookie } from "../../helpers/cookies";
+import { withCors, handleOptions } from "../../helpers/cors.js";
+import { setCookie } from "../../helpers/cookies.js";
 
 const COOKIE_NONCE = "tc_nonce";
 const NONCE_TTL = 60 * 10; // 10 minutes
