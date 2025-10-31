@@ -1,6 +1,6 @@
 // helpers/cookies.ts
 import type { VercelResponse } from "@vercel/node";
-import { IS_PROD } from "./env";
+import { IS_PROD } from "./env.js";
 
 export type CookieOptions = {
   httpOnly?: boolean;
