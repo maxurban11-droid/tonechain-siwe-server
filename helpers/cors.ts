@@ -1,39 +1,51 @@
-// helpers/cors.ts
-import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { ORIGIN_WHITELIST } from "./env.js";
+// helpers/cors.js
+const ORIGIN_WHITELIST = [
+  // exakte Domain deiner Framer-Site:
+  "https://concave-device-193297.framer.app",
+  // optional Dev:
+  "http://localhost:3000",
+  // Wildcard für Framer-Previews (optional, vorsichtig einsetzen)
+  "https://*.framer.app",
+];
 
-function allowOrigin(origin: string | undefined): string | null {
+function isAllowed(origin) {
   if (!origin) return null;
   const o = origin.replace(/\/+$/, "").toLowerCase();
-  if (ORIGIN_WHITELIST.length === 0) return o;
-  for (const raw of ORIGIN_WHITELIST) {
-    const entry = String(raw).replace(/\/+$/, "").toLowerCase();
+  for (const entryRaw of ORIGIN_WHITELIST) {
+    const entry = String(entryRaw).replace(/\/+$/, "").toLowerCase();
     if (!entry.includes("*")) {
       if (o === entry) return o;
       continue;
     }
+    // nur Subdomain-Wildcard (*.domain.tld)
     const esc = entry
       .replace(/[-/\\^$+?.()|[\]{}]/g, "\\$&")
       .replace(/\\\*\\\./g, "(?:[a-z0-9-]+\\.)+");
-    if (new RegExp(`^${esc}$`, "i").test(o)) return o;
+    const re = new RegExp(`^${esc}$`, "i");
+    if (re.test(o)) return o;
   }
   return null;
 }
 
-export function withCors(req: VercelRequest, res: VercelResponse) {
-  const origin = req.headers.origin as string | undefined;
-  const allowed = allowOrigin(origin);
+async function withCors(req, res) {
+  const allowed = isAllowed(req.headers.origin || "");
   if (allowed) {
     res.setHeader("Access-Control-Allow-Origin", allowed);
     res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Credentials", "true");
   }
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,Accept,X-Requested-With");
-  res.setHeader("Access-Control-Allow-Credentials", "true");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type,Authorization,Accept,X-Requested-With"
+  );
   res.setHeader("Access-Control-Max-Age", "86400");
+  return res;
 }
 
-export function handleOptions(req: VercelRequest, res: VercelResponse) {
+function handleOptions(req, res) {
   withCors(req, res);
-  res.status(204).end();
+  return res.status(204).end();
 }
+
+module.exports = { withCors, handleOptions };
