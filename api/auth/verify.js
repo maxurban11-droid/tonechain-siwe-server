@@ -1,159 +1,160 @@
-// api/auth/verify.js
-import { randomUUID } from "crypto";
+// /api/auth/verify.ts  — behutsam gehärtet
+import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { withCors } from "../../helpers/cors.js";
+import { setCookie, clearCookie } from "../../helpers/cookies.js";
+// wir nutzen ethers' verifyMessage wie zuvor (ist bereits installiert)
+import { verifyMessage } from "ethers";
 
-function allowCors(req, res) {
-  const origin = req.headers.origin || "";
-  const allow =
-    /^https:\/\/([a-z0-9-]+\.)?framer\.app$/.test(origin) ||
-    origin.includes("framer.com") ||
-    origin.includes("localhost");
+// ------- an deine Umgebung anpassen (klein halten, leicht revertierbar)
+const ALLOWED_DOMAINS = new Set<string>([
+  "tonechain.app",
+  // Framer-Preview / Live:
+  "concave-device-193297.framer.app",
+]);
 
-  if (allow) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Vary", "Origin");
-    res.setHeader("Access-Control-Allow-Credentials", "true");
-    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  }
-}
+const ALLOWED_URI_PREFIXES = [
+  "https://tonechain.app",
+  "https://concave-device-193297.framer.app",
+];
 
-function getCookie(req, name) {
-  const h = req.headers.cookie || "";
-  const m = h.match(new RegExp("(?:^|; )" + name + "=([^;]*)"));
-  return m ? decodeURIComponent(m[1]) : null;
-}
-function clearCookie(name) {
-  return [
-    `${name}=`,
-    "Path=/",
-    "HttpOnly",
-    "Secure",
-    "SameSite=None",
-    "Max-Age=0",
-  ].join("; ");
-}
-function setSessionCookie(value, maxAge = 60 * 60 * 24 * 14) {
-  return [
-    `tc_session=${encodeURIComponent(value)}`,
-    "Path=/",
-    "HttpOnly",
-    "Secure",
-    "SameSite=None",
-    `Max-Age=${maxAge}`,
-  ].join("; ");
-}
+const ALLOWED_CHAINS = new Set<number>([1, 11155111]); // mainnet + sepolia
+const MAX_AGE_MIN = 10;    // EIP-4361 IssuedAt darf nicht älter als 10min sein
+const MAX_SKEW_MS = 5 * 60 * 1000; // ±5min Clock-Skew Toleranz
 
-// robustes import für ethers v5 oder v6
-// robuste Ethers-Erkennung (v6 / v5 / default / utils)
-async function verifyWithEthers(message, signature) {
-  // 1) Versuche 'ethers' zu laden
-  let mod;
+// Session/Nonce Cookie Namen (wie in deinem Projekt)
+const COOKIE_NONCE = "tc_nonce";
+const COOKIE_SESSION = "tc_session";
+
+// kleine Helper
+function safeJson<T = any>(s: string | null): T | null {
+  try { return s ? JSON.parse(s) as T : null; } catch { return null; }
+}
+function now() { return Date.now(); }
+
+// sehr leichte „DB“ für Signature-Replay (In-Memory, per Lambda kalt reset)
+const seenSignatures = new Set<string>();
+
+// EIP-4361 Parsen (wir lesen nur das, was wir wirklich brauchen)
+type ParsedSiwe = {
+  domain: string;
+  address: string;
+  statement?: string;
+  uri: string;
+  version: string;
+  chainId: number;
+  nonce: string;
+  issuedAt: string;
+};
+function parseSiweMessage(msg: string): ParsedSiwe | null {
   try {
-    mod = await import("ethers");              // v6: named exports
+    // sehr einfache Zeilen-Extraktion – robust genug für unsere Message-Form
+    const lines = msg.split("\n").map(l => l.trim());
+    // Zeile 0: "<domain> wants you to sign in with your Ethereum account:"
+    const domain = lines[0]?.split(" ")[0] || "";
+    const address = lines[1] || "";
+    const statement = lines[3] || "";
+    // danach Key: Value Zeilen
+    const fields = new Map<string,string>();
+    for (let i=4;i<lines.length;i++){
+      const [k, ...rest] = lines[i].split(":");
+      if (!k || rest.length === 0) continue;
+      fields.set(k.trim().toLowerCase(), rest.join(":").trim());
+    }
+    const uri = fields.get("uri") || "";
+    const version = fields.get("version") || "1";
+    const chainId = Number(fields.get("chain id") || "1");
+    const nonce = fields.get("nonce") || "";
+    const issuedAt = fields.get("issued at") || "";
+
+    if (!domain || !address || !uri || !nonce || !issuedAt) return null;
+    return { domain, address, statement, uri, version, chainId, nonce, issuedAt };
   } catch {
-    // wenn gar nicht installiert o.ä. – gleich auf v5 utils Pfad fallen
+    return null;
   }
-
-  // 2) Versuche passende Funktion in allen Formen zu finden
-  const fn =
-    mod?.verifyMessage ||               // v6 (ESM named)
-    mod?.default?.verifyMessage ||      // v6 (default)
-    mod?.utils?.verifyMessage ||        // v5 (CJS namespace)
-    null;
-
-  if (fn) {
-    return fn(message, signature);
-  }
-
-  // 3) Expliziter v5-Utils-Fallback (ESM Pfad)
-  try {
-    const utilsMod = await import("ethers/lib/utils.js");
-    if (utilsMod?.verifyMessage) {
-      return utilsMod.verifyMessage(message, signature);
-    }
-    if (utilsMod?.default?.verifyMessage) {
-      return utilsMod.default.verifyMessage(message, signature);
-    }
-    if (utilsMod?.utils?.verifyMessage) {
-      return utilsMod.utils.verifyMessage(message, signature);
-    }
-  } catch (_) {
-    // ignorieren – wir werfen gleich unten einen sprechenden Fehler
-  }
-
-  throw new Error("ethers.verifyMessage not found");
 }
 
-export default async function handler(req, res) {
-  allowCors(req, res);
-
+async function handler(req: VercelRequest, res: VercelResponse) {
+  // Preflight handled by withCors
   if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method !== "POST")
-    return res.status(405).json({ ok: false, error: "Method not allowed" });
+  if (req.method !== "POST") return res.status(405).json({ ok: false, error: "Method Not Allowed" });
 
-  try {
-    const { message, signature } = (await readJson(req)) || {};
-    if (!message || !signature)
-      return res.status(400).json({ ok: false, error: "Missing payload" });
-
-    // 1) Nonce aus Message extrahieren (Zeile "Nonce: <value>")
-    const nonceInMsg = (message.match(/^\s*Nonce:\s*([^\s]+)\s*$/mi) || [])[1];
-    if (!nonceInMsg)
-      return res.status(400).json({ ok: false, error: "Nonce missing in message" });
-
-    // 2) Cookie vergleichen
-    const nonceCookie = getCookie(req, "tc_nonce");
-    if (!nonceCookie) {
-      return res.status(401).json({ ok: false, error: "Nonce cookie missing" });
-    }
-    if (nonceCookie !== nonceInMsg) {
-      return res.status(401).json({ ok: false, error: "Nonce mismatch" });
-    }
-
-    // 3) Signatur prüfen → Adresse recovern
-    let recovered;
-    try {
-      recovered = await verifyWithEthers(message, signature);
-    } catch (e) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Invalid signature", detail: String(e?.message || e) });
-    }
-
-    // 4) Nonce invalidieren + Session setzen
-    const sessionPayload = JSON.stringify({
-      v: 1,
-      addr: recovered,
-      iat: Date.now(),
-      sid: randomUUID(),
-    });
-
-    res.setHeader("Set-Cookie", [
-      clearCookie("tc_nonce"),
-      setSessionCookie(sessionPayload),
-    ]);
-
-    return res.status(200).json({ ok: true, address: recovered });
-  } catch (e) {
-    return res
-      .status(500)
-      .json({ ok: false, error: "Server error", detail: String(e?.message || e) });
+  // Payload lesen
+  const { message, signature } = safeJson<{message:string; signature:string}>(req.body as any) ?? {};
+  if (!message || !signature) {
+    return res.status(400).json({ ok: false, error: "Missing message or signature" });
   }
+
+  // tc_nonce aus Cookie
+  const nonceCookie = req.cookies?.[COOKIE_NONCE] || null;
+  if (!nonceCookie) {
+    return res.status(401).json({ ok: false, error: "Nonce missing (cookie)" });
+  }
+
+  // Message parsen
+  const parsed = parseSiweMessage(message);
+  if (!parsed) {
+    return res.status(400).json({ ok: false, error: "Invalid SIWE message format" });
+  }
+
+  // 1) Domain / URI / Chain prüfen (behutsam, mit Whitelist)
+  if (!ALLOWED_DOMAINS.has(parsed.domain)) {
+    return res.status(400).json({ ok: false, error: "Domain not allowed" });
+  }
+  if (!ALLOWED_URI_PREFIXES.some(p => parsed.uri.startsWith(p))) {
+    return res.status(400).json({ ok: false, error: "URI not allowed" });
+  }
+  if (!ALLOWED_CHAINS.has(parsed.chainId)) {
+    return res.status(400).json({ ok: false, error: "Chain not allowed" });
+  }
+
+  // 2) Nonce aus Message == Cookie?
+  if (parsed.nonce !== nonceCookie) {
+    return res.status(401).json({ ok: false, error: "Nonce mismatch" });
+  }
+
+  // 3) IssuedAt Frische prüfen (<= MAX_AGE_MIN, ± Skew)
+  const t = Date.parse(parsed.issuedAt);
+  if (Number.isNaN(t)) {
+    return res.status(400).json({ ok: false, error: "issuedAt invalid" });
+  }
+  const age = now() - t;
+  if (age < -MAX_SKEW_MS || age > (MAX_AGE_MIN * 60 * 1000 + MAX_SKEW_MS)) {
+    return res.status(400).json({ ok: false, error: "Message too old" });
+  }
+
+  // 4) Signature Replay-Schutz (in-memory)
+  if (seenSignatures.has(signature)) {
+    return res.status(409).json({ ok: false, error: "Replay detected" });
+  }
+
+  // 5) Signatur verifizieren
+  let recovered: string;
+  try {
+    recovered = await verifyMessage(message, signature);
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: "Invalid signature", detail: e?.message });
+  }
+  const same = recovered?.toLowerCase() === parsed.address?.toLowerCase();
+  if (!same) {
+    return res.status(401).json({ ok: false, error: "Address mismatch" });
+  }
+
+  // 6) Erfolg → Nonce verwerfen, Session setzen
+  seenSignatures.add(signature); // billig, reicht erstmal
+  clearCookie(res, COOKIE_NONCE);
+
+  // Session: einfache, signaturlose Variante (du hast das bereits im Einsatz)
+  // Optional: hier stattdessen sessionId generieren + in DB/KV persistieren
+  const sessionPayload = JSON.stringify({ a: recovered, iat: Date.now() });
+  setCookie(res, COOKIE_SESSION, sessionPayload, {
+    httpOnly: true,
+    sameSite: "None",
+    secure: true,
+    path: "/",
+    maxAge: 60 * 60 * 24 * 7, // 7 Tage
+  });
+
+  return res.status(200).json({ ok: true, address: recovered });
 }
 
-// Body lesen (ohne zusätzliche deps)
-function readJson(req) {
-  return new Promise((resolve, reject) => {
-    let data = "";
-    req.on("data", (c) => (data += c));
-    req.on("end", () => {
-      try {
-        resolve(data ? JSON.parse(data) : {});
-      } catch (e) {
-        reject(e);
-      }
-    });
-    req.on("error", reject);
-  });
-}
+export default withCors(handler);
