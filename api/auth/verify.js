@@ -44,16 +44,44 @@ function setSessionCookie(value, maxAge = 60 * 60 * 24 * 14) {
 }
 
 // robustes import für ethers v5 oder v6
+// robuste Ethers-Erkennung (v6 / v5 / default / utils)
 async function verifyWithEthers(message, signature) {
+  // 1) Versuche 'ethers' zu laden
+  let mod;
   try {
-    // ethers v6
-    const { verifyMessage } = await import("ethers");
-    return verifyMessage(message, signature);
+    mod = await import("ethers");              // v6: named exports
   } catch {
-    // ethers v5
-    const { utils } = await import("ethers/lib/utils.js");
-    return utils.verifyMessage(message, signature);
+    // wenn gar nicht installiert o.ä. – gleich auf v5 utils Pfad fallen
   }
+
+  // 2) Versuche passende Funktion in allen Formen zu finden
+  const fn =
+    mod?.verifyMessage ||               // v6 (ESM named)
+    mod?.default?.verifyMessage ||      // v6 (default)
+    mod?.utils?.verifyMessage ||        // v5 (CJS namespace)
+    null;
+
+  if (fn) {
+    return fn(message, signature);
+  }
+
+  // 3) Expliziter v5-Utils-Fallback (ESM Pfad)
+  try {
+    const utilsMod = await import("ethers/lib/utils.js");
+    if (utilsMod?.verifyMessage) {
+      return utilsMod.verifyMessage(message, signature);
+    }
+    if (utilsMod?.default?.verifyMessage) {
+      return utilsMod.default.verifyMessage(message, signature);
+    }
+    if (utilsMod?.utils?.verifyMessage) {
+      return utilsMod.utils.verifyMessage(message, signature);
+    }
+  } catch (_) {
+    // ignorieren – wir werfen gleich unten einen sprechenden Fehler
+  }
+
+  throw new Error("ethers.verifyMessage not found");
 }
 
 export default async function handler(req, res) {
