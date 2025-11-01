@@ -1,24 +1,30 @@
 // /api/auth/verify.ts  — behutsam gehärtet
 import type { VercelRequest, VercelResponse } from "@vercel/node";
+// api/auth/verify.js — behutsam gehärtet
 import { withCors } from "../../helpers/cors.js";
-import { setCookie, clearCookie } from "../../helpers/cookies.js";
-// wir nutzen ethers' verifyMessage wie zuvor (ist bereits installiert)
+import { clearCookie, setCookie } from "../../helpers/cookies.js";
 import { verifyMessage } from "ethers";
 
-module.exports = withCors(async function handler(req, res) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ ok: false, error: 'Method Not Allowed' });
+// Wir wrappen alles mit withCors → beantwortet OPTIONS korrekt mit CORS-Headers
+export default withCors(async function handler(req, res) {
+  if (req.method !== "POST") {
+    return res.status(405).json({ ok: false, error: "Method Not Allowed" });
   }
 
   try {
     const { message, signature } = req.body || {};
     if (!message || !signature) {
-      return res.status(400).json({ ok: false, error: 'Missing message or signature' });
+      return res
+        .status(400)
+        .json({ ok: false, error: "Missing message or signature" });
     }
 
-        return res.status(200).json({ ok: true });
+    // ✅ Aktuell noch Platzhalter, später kommt hier die echte SIWE-Prüfung rein
+    return res.status(200).json({ ok: true });
   } catch (e) {
-    return res.status(400).json({ ok: false, error: e?.message || 'Verify failed' });
+    return res
+      .status(400)
+      .json({ ok: false, error: e?.message || "Verify failed" });
   }
 });
 
