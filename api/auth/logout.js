@@ -1,51 +1,56 @@
-// api/auth/logout.js
-import { withCors } from "../../helpers/cors.js";
+// api/auth/logout.ts  (Node/Edge neutral, Vercel Functions)
+// Falls du TS nicht nutzt: gleiche Logik in .js ohne Typen.
+import type { VercelRequest, VercelResponse } from '@vercel/node';
 
-function killCookie(name) {
-  return (
-    `${name}=; Path=/; HttpOnly; Secure; SameSite=None;` +
-    ` Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0`
-  );
-}
+const ALLOW_ORIGINS = [
+  'https://concave-device-193297.framer.app',
+  'https://*.framer.app',                 // Wildcard wird unten manuell gematcht
+  'https://tonechain.app',
+];
 
-async function core(req, res) {
-  if (req.method !== "POST") {
-    return res.status(405).json({ ok: false, error: "Method not allowed" });
+function matchOrigin(origin: string | undefined) {
+  if (!origin) return null;
+  for (const pat of ALLOW_ORIGINS) {
+    if (pat.includes('*')) {
+      // sehr einfache Wildcard (nur *.domain.tld)
+      const re = new RegExp('^https://[^/]*\\.' + pat.replace('https://*.','').replace('.','\\.') + '$');
+      if (re.test(origin)) return origin;
+    } else if (origin === pat) {
+      return origin;
+    }
   }
-  const cookiesToClear = ["tc_session", "tc_nonce", "tonechain_session", "tonechain_nonce"];
-  res.setHeader("Set-Cookie", cookiesToClear.map(killCookie));
-  res.setHeader("Cache-Control", "no-store");
-  return res.status(200).json({ ok: true, loggedOut: true });
+  return null;
 }
 
-export default withCors(core);
-export default async function handler(req, res) {
-  // --- CORS (hart, bis der Helper wieder dran ist)
-  const origin = req.headers.origin || "*";
-  res.setHeader("Access-Control-Allow-Origin", origin);
-  res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Credentials", "true");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+function setCors(res: VercelResponse, origin?: string | null) {
+  if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Vary', 'Origin'); // wichtig für Caches
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+}
 
-  if (req.method === "OPTIONS") {
+function clearCookie(res: VercelResponse, name: string) {
+  // Cookie für Cross-Site-Use immer mit SameSite=None; Secure
+  res.setHeader('Set-Cookie', `${name}=; Path=/; Max-Age=0; HttpOnly; SameSite=None; Secure`);
+}
+
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  const origin = matchOrigin(req.headers.origin as string | undefined);
+  setCors(res, origin);
+
+  // Preflight sauber beantworten
+  if (req.method === 'OPTIONS') {
     return res.status(204).end();
   }
 
-  if (req.method !== "POST") {
-    return res.status(405).json({ ok: false, error: "Method not allowed" });
+  if (req.method !== 'POST') {
+    return res.status(405).json({ ok: false, error: 'Method Not Allowed' });
   }
 
-  // --- Cookies löschen (eventuelle alte Namen mit abräumen)
-  const cookiesToClear = [
-    "tc_session",
-    "tc_nonce",
-    // evtl. Legacy-Namen hier ergänzen:
-    "tonechain_session",
-    "tonechain_nonce",
-  ];
-  res.setHeader("Set-Cookie", cookiesToClear.map(killCookie));
+  // Session-Cookies löschen (Namen ggf. anpassen)
+  clearCookie(res, 'tc_session');
+  clearCookie(res, 'tc_nonce');
 
-  res.setHeader("Cache-Control", "no-store");
   return res.status(200).json({ ok: true, loggedOut: true });
 }
