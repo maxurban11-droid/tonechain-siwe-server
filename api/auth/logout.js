@@ -1,12 +1,24 @@
-// api/auth/logout.js — minimal + Cookies killen, noch ohne Imports
+// api/auth/logout.js
+import { withCors } from "../../helpers/cors.js";
+
 function killCookie(name) {
-  // löscht sofort (ExPIRES in Vergangenheit + Max-Age=0)
   return (
     `${name}=; Path=/; HttpOnly; Secure; SameSite=None;` +
     ` Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0`
   );
 }
 
+async function core(req, res) {
+  if (req.method !== "POST") {
+    return res.status(405).json({ ok: false, error: "Method not allowed" });
+  }
+  const cookiesToClear = ["tc_session", "tc_nonce", "tonechain_session", "tonechain_nonce"];
+  res.setHeader("Set-Cookie", cookiesToClear.map(killCookie));
+  res.setHeader("Cache-Control", "no-store");
+  return res.status(200).json({ ok: true, loggedOut: true });
+}
+
+export default withCors(core);
 export default async function handler(req, res) {
   // --- CORS (hart, bis der Helper wieder dran ist)
   const origin = req.headers.origin || "*";
