@@ -1,6 +1,7 @@
 // api/auth/logout.ts  (Node/Edge neutral, Vercel Functions)
 // Falls du TS nicht nutzt: gleiche Logik in .js ohne Typen.
 import type { VercelRequest, VercelResponse } from '@vercel/node';
+import { withCors, handleOptions } from '../../helpers/cors';
 
 const ALLOW_ORIGINS = [
   'https://concave-device-193297.framer.app',
