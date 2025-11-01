@@ -1,5 +1,3 @@
-// /api/auth/verify.ts  — behutsam gehärtet
-import type { VercelRequest, VercelResponse } from "@vercel/node";
 // api/auth/verify.js — behutsam gehärtet
 import { withCors } from "../../helpers/cors.js";
 import { clearCookie, setCookie } from "../../helpers/cookies.js";
