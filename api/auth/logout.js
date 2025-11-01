@@ -1,17 +1,22 @@
 // api/auth/logout.js
-const { withCors, handleOptions } = require("../../helpers/cors.js");
+import { withCors, handleOptions } from "../../helpers/cors.js";
+import { clearCookie } from "../../helpers/cookies.js";
 
-module.exports = (req, res) => {
+export default withCors(async function handler(req, res) {
+  // Preflight sauber beantworten
   if (req.method === "OPTIONS") return handleOptions(req, res);
-  withCors(req, res);
 
-  if (req.method !== "POST")
-    return res.status(405).json({ ok: false, error: "Method Not Allowed" });
+  if (req.method !== "POST") {
+    res.status(405).json({ ok: false, error: "Method not allowed" });
+    return;
+  }
 
-  res.setHeader("Set-Cookie", [
-    "tc_session=; Path=/; Max-Age=0; HttpOnly; SameSite=None; Secure",
-    "tc_nonce=; Path=/; Max-Age=0; HttpOnly; SameSite=None; Secure",
-  ]);
+  // Session-Cookies löschen
+  clearCookie(res, "tc_session");
+  clearCookie(res, "tc_nonce"); // optional, schadet nicht
 
-  return res.status(200).json({ ok: true, loggedOut: true });
-};
+  // CORS-Helper setzt:
+  // - Access-Control-Allow-Origin: <erlaubter Origin>
+  // - Access-Control-Allow-Credentials: true
+  res.status(200).json({ ok: true, loggedOut: true });
+});
