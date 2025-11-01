@@ -42,32 +42,13 @@ function allowCors(req, res) {
   }
 }
 
-export default async function handler(req, res) {
-  allowCors(req, res);
-
-  if (req.method === "OPTIONS") {
-    return res.status(204).end();
-  }
-  if (req.method !== "POST") {
-    return res.status(405).json({ ok: false, error: "Method not allowed" });
-  }
-
-  // 1) Nonce erzeugen
-  const nonce = randomUUID();
-
-  // 2) Cookie setzen – Cross-Site zwingend: SameSite=None; Secure
-  //    httpOnly + Path + Max-Age nicht vergessen
-  const cookie = [
-    `tc_nonce=${encodeURIComponent(nonce)}`,
-    "Path=/",
-    "HttpOnly",
-    "Secure",
-    "SameSite=None",
-    "Max-Age=600", // 10 min
-  ].join("; ");
-
-  res.setHeader("Set-Cookie", cookie);
-
-  // 3) Response
+export default withCors(async function handler(req, res) {
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method !== "POST") return res.status(405).json({ ok: false });
+  const nonce = crypto.randomUUID?.() || Math.random().toString(36).slice(2);
+  res.setHeader(
+    "Set-Cookie",
+    `tc_nonce=${nonce}; Path=/; HttpOnly; SameSite=None; Secure; Max-Age=300`
+  );
   return res.status(200).json({ ok: true, nonce });
-}
+});
