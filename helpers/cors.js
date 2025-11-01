@@ -1,7 +1,6 @@
 // helpers/cors.js
 const DEFAULT_ORIGINS = [
   "https://concave-device-193297.framer.app",
-  "https://*.framer.app",
   "https://tonechain.app",
   "http://localhost:3000",
   "http://127.0.0.1:3000",
