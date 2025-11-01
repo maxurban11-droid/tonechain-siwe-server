@@ -5,6 +5,24 @@ import { setCookie, clearCookie } from "../../helpers/cookies.js";
 // wir nutzen ethers' verifyMessage wie zuvor (ist bereits installiert)
 import { verifyMessage } from "ethers";
 
+module.exports = withCors(async function handler(req, res) {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ ok: false, error: 'Method Not Allowed' });
+  }
+
+  try {
+    const { message, signature } = req.body || {};
+    if (!message || !signature) {
+      return res.status(400).json({ ok: false, error: 'Missing message or signature' });
+    }
+
+        return res.status(200).json({ ok: true });
+  } catch (e) {
+    return res.status(400).json({ ok: false, error: e?.message || 'Verify failed' });
+  }
+});
+
+
 // ------- an deine Umgebung anpassen (klein halten, leicht revertierbar)
 const ALLOWED_DOMAINS = new Set<string>([
   "tonechain.app",
