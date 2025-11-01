@@ -1,5 +1,6 @@
 // api/auth/verify.js
 import { randomUUID } from "crypto";
+import { withCors } from "../../helpers/cors.js";
 
 function allowCors(req, res) {
   const origin = req.headers.origin || "";
