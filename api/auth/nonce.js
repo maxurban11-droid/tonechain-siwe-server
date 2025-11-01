@@ -1,10 +1,30 @@
 // api/auth/nonce.js
 import { randomUUID } from "crypto";
+import { withCors } from "../../helpers/cors.js";
 
-// Falls du already einen withCors-Wrapper nutzt, lass ihn drum.
-// Wichtig: Er muss Access-Control-Allow-Origin = <req.headers.origin> (nicht "*")
-//          und Access-Control-Allow-Credentials = "true" setzen,
-//          plus OPTIONS 204 handeln.
+function setCookie(name, value, maxAgeSec) {
+  const parts = [
+    `${name}=${encodeURIComponent(value)}`,
+    "Path=/",
+    "HttpOnly",
+    "Secure",
+    "SameSite=None",
+  ];
+  if (maxAgeSec) parts.push(`Max-Age=${maxAgeSec}`);
+  return parts.join("; ");
+}
+
+async function core(req, res) {
+  if (req.method !== "POST") {
+    return res.status(405).json({ ok: false, error: "Method not allowed" });
+  }
+  const nonce = crypto.randomUUID();
+  res.setHeader("Set-Cookie", setCookie("tc_nonce", nonce, 600)); // 10 min
+  res.setHeader("Cache-Control", "no-store");
+  return res.status(200).json({ ok: true, nonce });
+}
+
+export default withCors(core);
 
 function allowCors(req, res) {
   const origin = req.headers.origin || "";
