@@ -21,10 +21,14 @@ const sbAdmin = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
 const ALLOWED_DOMAINS = new Set([
   "tonechain.app",
   "concave-device-193297.framer.app",
+  // Optional Dev:
+  // "localhost",
+  // "127.0.0.1",
 ]);
 const ALLOWED_URI_PREFIXES = [
   "https://tonechain.app",
   "https://concave-device-193297.framer.app",
+  // "http://localhost:3000",
 ];
 const ALLOWED_CHAINS = new Set([1, 11155111]);   // mainnet + sepolia
 const MAX_AGE_MIN   = 10;                        // IssuedAt max. 10 min alt
@@ -64,8 +68,9 @@ function getCookie(req, name) {
 function now() { return new Date(); }
 function originAllowed(req) {
   const origin = req.headers.origin || "";
+  // ✅ Fallback: same-origin Requests ohne Origin erlauben
+  if (!origin) return true;
   try {
-    if (!origin) return false;
     const u = new URL(origin);
     return ALLOWED_DOMAINS.has(u.hostname);
   } catch { return false; }
@@ -139,6 +144,8 @@ async function verifyPersonalSign(message, signature) {
 
 /* ============ Handler ============ */
 export default withCors(async function handler(req, res) {
+  res.setHeader("Cache-Control", "no-store");
+
   if (req.method !== "POST") {
     return res.status(405).json({ ok: false, code: "METHOD_NOT_ALLOWED" });
   }
@@ -192,7 +199,7 @@ export default withCors(async function handler(req, res) {
     return res.status(401).json({ ok: false, code: "ADDRESS_MISMATCH" });
   }
 
-  // ========= NEU: Registrierungs-Check in Supabase =========
+  // ========= Registrierungs-Check in Supabase =========
   const addressLower = String(siwe.address || "").toLowerCase();
 
   if (!sbAdmin) {
