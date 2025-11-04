@@ -26,6 +26,15 @@ function setDebug(res, msg) {
 }
 
 /* ===== kleine Helfer ===== */
+function originAllowed(origin) {
+  try {
+    if (!origin) return false;
+    const u = new URL(origin);
+    return ALLOWED_DOMAINS.has(u.hostname);
+  } catch {
+    return false;
+  }
+}
 function sign(val) {
   if (!SESSION_SECRET) return null;
   return crypto.createHmac("sha256", SESSION_SECRET).update(val).digest("hex");
@@ -99,16 +108,21 @@ function parseSiweMessage(msg) {
 
 /* ===== Handler ===== */
 export default async function handler(req, res) {
-  // --- CORS IMMER zuerst ---
   const origin = req.headers.origin || "";
+  const allowed = originAllowed(origin);
+
+  // --- CORS: nur whitelisted Origins spiegeln, niemals "*" bei credentials:true ---
   res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Origin", origin || "*");
-  res.setHeader("Access-Control-Allow-Credentials", "true");
+  if (allowed) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+  }
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
   if (req.method === "OPTIONS") {
-    setDebug(res, "preflight-ok");
+    // Preflight: wenn Origin nicht whitelisted ist, liefern wir 204 ohne ACAO
+    setDebug(res, allowed ? "preflight-ok" : "preflight-denied");
     return res.status(204).end();
   }
   if (req.method !== "POST") {
@@ -117,8 +131,6 @@ export default async function handler(req, res) {
 
   try {
     // 1) Origin-Gate (nach Preflight)
-    let allowed = false;
-    try { allowed = !!(origin && ALLOWED_DOMAINS.has(new URL(origin).hostname)); } catch {}
     if (!allowed) {
       setDebug(res, "origin-denied");
       return res.status(403).json({ ok: false, code: "ORIGIN_NOT_ALLOWED" });
