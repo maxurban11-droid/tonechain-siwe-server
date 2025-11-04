@@ -1,9 +1,9 @@
 // /api/auth/verify.js  — stabile SIWE-Verify-Route mit Registrierungs-/Link-Option (Node runtime)
-
 import crypto from "node:crypto";
 
 /* ===== Konfiguration ===== */
 const ALLOWED_DOMAINS = new Set([
+  // explizite Prod-Hosts
   "tonechain.app",
   "concave-device-193297.framer.app",
 ]);
@@ -30,15 +30,28 @@ function originAllowed(origin) {
   try {
     if (!origin) return false;
     const u = new URL(origin);
-    return ALLOWED_DOMAINS.has(u.hostname);
+    const host = u.hostname;
+
+    // 1) exakte, whiteliste Hosts
+    if (ALLOWED_DOMAINS.has(host)) return true;
+
+    // 2) Framer-Previews & neue Domains erlauben
+    if (host.endsWith(".framer.app") || host.endsWith(".framer.website")) return true;
+
+    // 3) lokale Entwicklung
+    if (host === "localhost" || host === "127.0.0.1") return true;
+
+    return false;
   } catch {
     return false;
   }
 }
+
 function sign(val) {
   if (!SESSION_SECRET) return null;
   return crypto.createHmac("sha256", SESSION_SECRET).update(val).digest("hex");
 }
+
 function setCookie(res, name, value, opts = {}) {
   const parts = [`${name}=${value}`];
   parts.push("Path=/");
@@ -51,26 +64,31 @@ function setCookie(res, name, value, opts = {}) {
   const out = [...(Array.isArray(prev) ? prev : prev ? [String(prev)] : []), parts.join("; ")];
   res.setHeader("Set-Cookie", out);
 }
+
 function clearCookie(res, name) {
   const del = `${name}=; Path=/; Max-Age=0; HttpOnly; SameSite=None; Secure; Partitioned`;
   const prev = res.getHeader("Set-Cookie");
   const out = [...(Array.isArray(prev) ? prev : prev ? [String(prev)] : []), del];
   res.setHeader("Set-Cookie", out);
 }
+
 function getCookie(req, name) {
   const raw = req.headers.cookie || "";
   const m = raw.split(/;\s*/).find(s => s.startsWith(name + "="));
   return m ? decodeURIComponent(m.split("=").slice(1).join("=")) : null;
 }
+
 function withinAge(iso) {
   const t = Date.parse(iso);
   if (!Number.isFinite(t)) return false;
   const age = Math.abs(Date.now() - t);
   return age <= (MAX_AGE_MIN * 60 * 1000 + MAX_SKEW_MS);
 }
+
 function addrEq(a, b) {
   return String(a || "").toLowerCase() === String(b || "").toLowerCase();
 }
+
 function parseSiweMessage(msg) {
   const lines = String(msg || "").split("\n");
   if (lines.length < 8) return null;
@@ -78,14 +96,14 @@ function parseSiweMessage(msg) {
   const domain  = (lines[0] || "").split(" ")[0] || "";
   const address = (lines[1] || "").trim();
 
-  // ab Zeile 2 die "Key: Value"-Zeilen suchen
+  // "Key: Value"-Zeilen finden
   let i = 2;
   while (i < lines.length && !/^[A-Za-z ]+:\s/.test(lines[i])) i++;
 
   const fields = {};
   for (; i < lines.length; i++) {
     const row = lines[i];
-       const idx = row.indexOf(":");
+    const idx = row.indexOf(":");
     if (idx === -1) continue;
     const k = row.slice(0, idx).trim().toLowerCase();
     const v = row.slice(idx + 1).trim();
@@ -106,6 +124,7 @@ function parseSiweMessage(msg) {
   }
   return out;
 }
+
 function readBearer(req) {
   const h = req.headers.authorization || req.headers.Authorization;
   if (!h) return null;
@@ -118,13 +137,14 @@ export default async function handler(req, res) {
   const origin = req.headers.origin || "";
   const allowed = originAllowed(origin);
 
-  // --- CORS ---
+  // --- CORS: nur whitelisted Origins spiegeln, niemals "*" mit credentials ---
   res.setHeader("Vary", "Origin");
   if (allowed) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Access-Control-Allow-Credentials", "true");
   }
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  // WICHTIG: X-TC-Intent zulassen (Link-Flow), Authorization für Bearer
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-TC-Intent");
 
   if (req.method === "OPTIONS") {
@@ -136,6 +156,7 @@ export default async function handler(req, res) {
   }
 
   try {
+    // Origin-Gate nach Preflight
     if (!allowed) {
       setDebug(res, "origin-denied");
       return res.status(403).json({ ok: false, code: "ORIGIN_NOT_ALLOWED" });
@@ -232,7 +253,7 @@ export default async function handler(req, res) {
 
     let userId = null;
 
-    // 6a) OPTIONALER LINK-FALL: Wallet noch nicht registriert, aber wir dürfen linken
+    // 6a) LINK-FALL: Wallet noch nicht registriert, Intent=link + gültiger Bearer
     if (!isRegistered && intent === "link" && bearer) {
       setDebug(res, "stage:link-mode");
 
@@ -244,7 +265,7 @@ export default async function handler(req, res) {
       }
       const authUserId = authData.user.id;
 
-      // Profil zu diesem E-Mail-User finden/erzeugen
+      // Profil zum E-Mail-User finden/erstellen
       let linkProfileId = null;
       const { data: existingProfile } = await sbAdmin
         .from("profiles").select("id").eq("user_id", authUserId).maybeSingle();
@@ -260,7 +281,7 @@ export default async function handler(req, res) {
         linkProfileId = profNew.id;
       }
 
-      // Wallet upsert (falls noch nicht vorhanden)
+      // Wallet upsert + ggf. verlinken
       const { error: upErr } = await sbAdmin
         .from("wallets").upsert({ address: addressLower }, { onConflict: "address" });
       if (upErr) {
@@ -268,7 +289,6 @@ export default async function handler(req, res) {
         return res.status(500).json({ ok: false, code: "DB_UPSERT_ERROR" });
       }
 
-      // Wallet-Row ziehen
       const { data: walletRow, error: wErr } = await sbAdmin
         .from("wallets").select("user_id").eq("address", addressLower).maybeSingle();
       if (wErr) {
@@ -276,7 +296,6 @@ export default async function handler(req, res) {
         return res.status(500).json({ ok: false, code: "DB_SELECT_ERROR" });
       }
 
-      // Konflikt, falls schon an anderes Profil gebunden
       if (walletRow?.user_id && walletRow.user_id !== linkProfileId) {
         return res.status(409).json({
           ok: false,
@@ -285,7 +304,6 @@ export default async function handler(req, res) {
         });
       }
 
-      // Verlinken
       if (!walletRow?.user_id) {
         const { error: linkErr } = await sbAdmin
           .from("wallets").update({ user_id: linkProfileId }).eq("address", addressLower);
@@ -298,7 +316,7 @@ export default async function handler(req, res) {
       userId = linkProfileId; // für Session
     }
 
-    // 6b) Wenn weiterhin nicht registriert (kein Link-Fall) -> Client soll /register nutzen
+    // 6b) nicht registriert (und kein Link-Fall) -> Client soll /register nutzen
     if (!isRegistered && !userId) {
       setDebug(res, "wallet-not-registered");
       return res.status(403).json({
@@ -308,7 +326,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // 7) user_id lookup (Falls registriert war; im Link-Fall oben bereits gesetzt)
+    // 7) user_id lookup (wenn registriert; im Link-Fall bereits gesetzt)
     if (!userId) {
       try {
         const { data: row } = await sbAdmin
