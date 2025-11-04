@@ -24,13 +24,10 @@ function setCookie(res, name, value, opts = {}) {
   parts.push("HttpOnly");
   parts.push("SameSite=None");
   parts.push("Secure");
-  // Wichtig für 3rd-party in 2025:
-  parts.push("Partitioned"); // CHIPS
-
+  parts.push("Partitioned"); // <<< WICHTIG für 3rd-party / CHIPS
   const prev = res.getHeader("Set-Cookie");
   res.setHeader("Set-Cookie", [...(prev ? [].concat(prev) : []), parts.join("; ")]);
 }
-
 export default async function handler(req, res) {
   const origin = req.headers.origin || "";
   // Debug-Header: im Network-Tab leicht sichtbar
