@@ -164,7 +164,7 @@ async function handler(req, res) {
     return res.status(401).json({ ok: false, code: "ADDRESS_MISMATCH" });
   }
 
-  // 6) Supabase: Wallet registrieren (upsert)
+   // 6) Supabase: Wallet registrieren (upsert) + Profile-Link herstellen
   const SUPABASE_URL = process.env.SUPABASE_URL;
   const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
@@ -176,6 +176,8 @@ async function handler(req, res) {
   });
 
   const addressLower = String(siwe.address).toLowerCase();
+
+  // Upsert Wallet (stellt sicher, dass sie existiert)
   const { error: upErr } = await sb
     .from("wallets")
     .upsert({ address: addressLower }, { onConflict: "address" });
@@ -184,6 +186,71 @@ async function handler(req, res) {
     return res.status(500).json({ ok: false, code: "DB_UPSERT_ERROR" });
   }
 
+  // Aktuellen Wallet-Datensatz lesen
+  const { data: walletRow, error: wErr } = await sb
+    .from("wallets")
+    .select("user_id")
+    .eq("address", addressLower)
+    .single();
+  if (wErr) {
+    console.error("[register] read wallet failed:", wErr);
+    return res.status(500).json({ ok: false, code: "DB_READ_ERROR" });
+  }
+
+  let linkedUserId = walletRow?.user_id ?? null;
+
+  // Falls keine Verknüpfung existiert → Profile erzeugen und verlinken
+  if (!linkedUserId) {
+    // stabile UUID erzeugen (Node >=16: crypto.randomUUID)
+    let newId;
+    try {
+      const nodeCrypto = await import("node:crypto");
+      newId =
+        (nodeCrypto.randomUUID && nodeCrypto.randomUUID()) ||
+        nodeCrypto.randomBytes(16).toString("hex").replace(
+          /(.{8})(.{4})(.{4})(.{4})(.{12})/,
+          "$1-$2-$3-$4-$5"
+        );
+    } catch {
+      newId = "00000000-0000-4000-8000-" + Date.now().toString(16).padStart(12, "0");
+    }
+
+    const profilePayload = {
+      id: newId,
+      email: null,
+      creator_name: creatorName ? String(creatorName).trim() : null,
+      avatar_url: null,
+      // created_at hat default now()
+    };
+
+    const { error: pErr } = await sb.from("profiles").upsert(profilePayload, { onConflict: "id" });
+    if (pErr) {
+      console.error("[register] upsert profile failed:", pErr);
+      return res.status(500).json({ ok: false, code: "PROFILE_UPSERT_ERROR" });
+    }
+
+    const { error: linkErr } = await sb
+      .from("wallets")
+      .update({ user_id: newId })
+      .eq("address", addressLower);
+    if (linkErr) {
+      console.error("[register] link wallet->profile failed:", linkErr);
+      return res.status(500).json({ ok: false, code: "WALLET_LINK_ERROR" });
+    }
+
+    linkedUserId = newId;
+  } else if (creatorName && String(creatorName).trim()) {
+    // optional: Creator-Name beim existierenden Profil setzen, wenn leer
+    try {
+      await sb
+        .from("profiles")
+        .update({ creator_name: String(creatorName).trim() })
+        .eq("id", linkedUserId)
+        .is("creator_name", null);
+    } catch (e) {
+      console.warn("[register] optional profile name update skipped:", e?.message || e);
+    }
+  }
   // optional: creator_name setzen, wenn user_id verknüpft ist
   if (creatorName && String(creatorName).trim()) {
     try {
