@@ -18,9 +18,15 @@ function originAllowed(req) {
 }
 
 function setCookie(res, name, value, opts = {}) {
-  const parts = [`${name}=${value}`, "Path=/"];
+  const parts = [`${name}=${value}`];
+  parts.push("Path=/");
   if (opts.maxAgeSec != null) parts.push(`Max-Age=${opts.maxAgeSec}`);
-  parts.push("HttpOnly", "SameSite=None", "Secure");
+  parts.push("HttpOnly");
+  parts.push("SameSite=None");
+  parts.push("Secure");
+  // Wichtig für 3rd-party in 2025:
+  parts.push("Partitioned"); // CHIPS
+
   const prev = res.getHeader("Set-Cookie");
   res.setHeader("Set-Cookie", [...(prev ? [].concat(prev) : []), parts.join("; ")]);
 }
