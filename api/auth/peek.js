@@ -1,21 +1,13 @@
 // /api/auth/peek.js — robuste SIWE-Session-Inspektion (Node runtime)
-
 import { withCors } from "../../helpers/cors.js";
 import crypto from "node:crypto";
 
 /* ==============================
-   Konfiguration (konsistent zu verify.js)
+   Konfiguration
 ============================== */
 const COOKIE_SESSION = "tc_session";
-
-// Optional: Wenn gesetzt, werden Sessions serverseitig signiert/geprüft
+// Optional: serverseitige Signaturprüfung
 const SESSION_SECRET = process.env.SESSION_SECRET || null;
-
-// Domains wie in verify.js / nonce.js
-const ALLOWED_DOMAINS = new Set([
-  "tonechain.app",
-  "concave-device-193297.framer.app",
-]);
 
 /* ==============================
    Helpers
@@ -34,27 +26,22 @@ function readCookie(req, name) {
   return null;
 }
 
-function clearCookie(res, name) {
-  const prev = /** @type {string[]|undefined} */ (res.getHeader("Set-Cookie"));
-  const del = `${name}=; Path=/; Max-Age=0; HttpOnly; SameSite=None; Secure`;
-  res.setHeader("Set-Cookie", [...(prev || []), del]);
+function pushCookie(res, cookie) {
+  const prev = res.getHeader("Set-Cookie");
+  if (!prev) res.setHeader("Set-Cookie", [cookie]);
+  else if (Array.isArray(prev)) res.setHeader("Set-Cookie", [...prev, cookie]);
+  else res.setHeader("Set-Cookie", [String(prev), cookie]);
 }
 
-function originAllowed(req) {
-  const origin = req.headers.origin || "";
-  try {
-    if (!origin) return false;
-    const u = new URL(origin);
-    return ALLOWED_DOMAINS.has(u.hostname);
-  } catch {
-    return false;
-  }
+function clearCookie(res, name) {
+  // Cross-site kompatibel löschen
+  pushCookie(res, `${name}=; Path=/; Max-Age=0; HttpOnly; SameSite=None; Secure`);
 }
 
 /**
  * tc_session-Format (Base64):
  *   { raw, sig? }  // JSON-stringifiziert, dann Base64
- *   raw = JSON.stringify({ v:1, addr:string, ts:number, exp:number })
+ *   raw = JSON.stringify({ v:1, addr:string, ts:number, exp:number, userId?:string })
  *   sig = HMAC-SHA256(raw, SESSION_SECRET)   // optional
  */
 function decodeSessionCookie(sessionCookie) {
@@ -71,15 +58,13 @@ function decodeSessionCookie(sessionCookie) {
   const { raw, sig } = envelope;
   if (typeof raw !== "string") return null;
 
-  // Wenn SESSION_SECRET aktiv ist, Sig prüfen
   if (SESSION_SECRET) {
     const expect = sign(raw);
-    if (!sig || sig !== expect) return { invalid: true }; // manipuliert
+    if (!sig || sig !== expect) return { invalid: true };
   }
 
   try {
     const payload = JSON.parse(raw);
-    // Minimalvalidierung
     if (
       !payload ||
       typeof payload !== "object" ||
@@ -97,22 +82,9 @@ function decodeSessionCookie(sessionCookie) {
 }
 
 /* ==============================
-   Core-Handler
+   Core-Handler (CORS via withCors)
 ============================== */
 async function core(req, res) {
-  // CORS identisch zu den anderen Routen halten
-  const origin = req.headers.origin || "";
-  if (origin && originAllowed(req)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-  } else {
-    res.setHeader("Access-Control-Allow-Origin", "null");
-  }
-  res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Credentials", "true");
-  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-
-  if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "GET") {
     return res.status(405).json({ ok: false, code: "METHOD_NOT_ALLOWED" });
   }
@@ -128,7 +100,6 @@ async function core(req, res) {
 
   const decoded = decodeSessionCookie(sessionCookie);
   if (!decoded || decoded.invalid) {
-    // Invalid/manipuliert → Cookie weg
     clearCookie(res, COOKIE_SESSION);
     return res.status(200).json({
       ok: true,
@@ -137,10 +108,9 @@ async function core(req, res) {
     });
   }
 
-  const { payload } = decoded; // { v, addr, ts, exp }
+  const { payload } = decoded; // { v, addr, ts, exp, userId? }
   const now = Date.now();
   if (payload.exp <= now) {
-    // Abgelaufen → Cookie löschen
     clearCookie(res, COOKIE_SESSION);
     return res.status(200).json({
       ok: true,
@@ -150,16 +120,17 @@ async function core(req, res) {
     });
   }
 
-  // Aktiv
   return res.status(200).json({
     ok: true,
     hasSession: true,
     sessionAddress: payload.addr,
-    // optional nützlich für Debug/Telemetrie:
+    // optional:
+    // userId: payload.userId ?? null,
     // issuedAt: payload.ts,
     // expiresAt: payload.exp,
-    // serverNow: now,
   });
 }
 
 export default withCors(core);
+// Nicht als Edge laufen lassen
+export const config = { runtime: "nodejs" };
