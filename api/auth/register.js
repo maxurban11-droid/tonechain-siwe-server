@@ -186,6 +186,29 @@ async function handler(req, res) {
     return res.status(500).json({ ok: false, code: "DB_UPSERT_ERROR" });
   }
 
+  // Nach dem wallets-upsert:
+let userId = null;
+try {
+  const { data: ensured, error: fnErr } = await sb.rpc(
+    "ensure_profile_for_address",
+    { p_address: addressLower, p_creator_name: creatorName || null }
+  );
+  if (fnErr) {
+    console.error("[register] ensure_profile_for_address error:", fnErr);
+    return res.status(500).json({ ok: false, code: "PROFILE_UPSERT_ERROR" });
+  }
+  userId = ensured || null;
+} catch (e) {
+  console.error("[register] ensure_profile_for_address threw:", e);
+  return res.status(500).json({ ok: false, code: "PROFILE_UPSERT_ERROR" });
+}
+
+// Nonce ist single-use → löschen
+clearCookie(res, COOKIE_NONCE);
+
+// Erfolgreich
+return res.status(200).json({ ok: true, registered: true, userId, address: addressLower });
+
   // Aktuellen Wallet-Datensatz lesen
   const { data: walletRow, error: wErr } = await sb
     .from("wallets")
