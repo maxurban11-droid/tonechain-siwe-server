@@ -237,15 +237,16 @@ export default async function handler(req, res) {
       setDebug(res, "db-rpc-error");
       return res.status(500).json({ ok: false, code: "DB_RPC_ERROR" });
     }
-    if (!isRegistered) {
-      clearCookie(res, COOKIE_NONCE);
-      setDebug(res, "wallet-not-registered");
-      return res.status(403).json({
-        ok: false,
-        code: "WALLET_NOT_REGISTERED",
-        message: "No account found for this wallet. Please sign up first.",
-      });
-    }
+    // Wallet nicht registriert -> Nonce NICHT löschen.
+// Der Client nutzt denselben Nonce direkt für /register.
+     if (!isRegistered) {
+    setDebug(res, "wallet-not-registered");
+    return res.status(403).json({
+    ok: false,
+    code: "WALLET_NOT_REGISTERED",
+    message: "No account found for this wallet. Please sign up first.",
+   });
+}
 
     // 8) user_id lookup (optional für Session)
     let userId = null;
