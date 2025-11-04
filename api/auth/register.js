@@ -1,5 +1,7 @@
 // api/auth/register.js
 // SIWE-Register: Wallet upsert + (falls nötig) Profile anlegen + verlinken
+// WICHTIG: Wir LÖSCHEN die Nonce NICHT, damit /verify direkt mit derselben
+// signierten Message funktioniert (=> nur EIN MetaMask-Popup beim Sign-Up).
 
 import { withCors } from "../../helpers/cors.js";
 
@@ -11,7 +13,7 @@ const ALLOWED_URI_PREFIXES = [
   "https://tonechain.app",
   "https://concave-device-193297.framer.app",
 ];
-const ALLOWED_CHAINS = new Set([1, 11155111]);
+const ALLOWED_CHAINS = new Set([1, 11155111]); // mainnet + sepolia
 const MAX_AGE_MIN = 10;
 const MAX_SKEW_MS = 5 * 60 * 1000;
 const COOKIE_NONCE = "tc_nonce";
@@ -22,11 +24,6 @@ function getCookie(req, name) {
   const hit = raw.split(/;\s*/).find((s) => s.startsWith(name + "="));
   return hit ? decodeURIComponent(hit.split("=").slice(1).join("=")) : null;
 }
-function clearCookie(res, name) {
-  const del = `${name}=; Path=/; Max-Age=0; HttpOnly; SameSite=None; Secure; Partitioned`;
-  const prev = res.getHeader("Set-Cookie");
-  res.setHeader("Set-Cookie", [...(Array.isArray(prev) ? prev : prev ? [String(prev)] : []), del]);
-}
 function withinAge(iso) {
   const t = Date.parse(iso);
   if (!Number.isFinite(t)) return false;
@@ -36,9 +33,11 @@ function withinAge(iso) {
 function addrEq(a, b) {
   return String(a || "").toLowerCase() === String(b || "").toLowerCase();
 }
+// robuster SIWE-Parser (kompatibel zu verify.js)
 function parseSiweMessage(msg) {
   const lines = String(msg || "").split("\n");
   if (lines.length < 2) return null;
+
   const domain = (lines[0] || "").split(" ")[0] || "";
   const address = (lines[1] || "").trim();
 
@@ -75,7 +74,7 @@ async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "POST") return res.status(405).json({ ok: false, code: "METHOD_NOT_ALLOWED" });
 
-  // Origin-Whitelist (nach Preflight)
+  // CORS: Origin-Whitelist (nach Preflight)
   const origin = req.headers.origin || "";
   try {
     const host = origin ? new URL(origin).hostname : "";
@@ -86,7 +85,7 @@ async function handler(req, res) {
     return res.status(403).json({ ok: false, code: "ORIGIN_NOT_ALLOWED" });
   }
 
-  // Body
+  // Body lesen
   let body = req.body;
   if (body == null || typeof body !== "object") {
     try { body = JSON.parse(req.body || "{}"); } catch { body = {}; }
@@ -99,23 +98,34 @@ async function handler(req, res) {
     return res.status(400).json({ ok: false, code: "INVALID_PAYLOAD", message: "Missing message or signature" });
   }
 
-  // Server-Nonce
+  // Server-Nonce (vom /nonce-Endpoint als Cookie gesetzt)
   const cookieNonce = getCookie(req, COOKIE_NONCE);
   if (!cookieNonce) return res.status(400).json({ ok: false, code: "MISSING_SERVER_NONCE" });
 
-  // SIWE parse + Checks
+  // SIWE parsen + Grundchecks
   const siwe = parseSiweMessage(message);
   if (!siwe) return res.status(400).json({ ok: false, code: "INVALID_SIWE_FORMAT" });
-  if (!ALLOWED_DOMAINS.has(siwe.domain)) return res.status(400).json({ ok: false, code: "DOMAIN_NOT_ALLOWED" });
+
+  if (!ALLOWED_DOMAINS.has(siwe.domain)) {
+    return res.status(400).json({ ok: false, code: "DOMAIN_NOT_ALLOWED" });
+  }
   try {
     const u = new URL(siwe.uri);
     if (!ALLOWED_URI_PREFIXES.some((p) => u.href.startsWith(p))) {
       return res.status(400).json({ ok: false, code: "URI_NOT_ALLOWED" });
     }
-  } catch { return res.status(400).json({ ok: false, code: "URI_NOT_ALLOWED" }); }
-  if (!ALLOWED_CHAINS.has(Number(siwe.chainId))) return res.status(400).json({ ok: false, code: "CHAIN_NOT_ALLOWED" });
-  if (!withinAge(siwe.issuedAt)) return res.status(400).json({ ok: false, code: "MESSAGE_TOO_OLD" });
-  if (siwe.nonce !== cookieNonce) return res.status(401).json({ ok: false, code: "NONCE_MISMATCH" });
+  } catch {
+    return res.status(400).json({ ok: false, code: "URI_NOT_ALLOWED" });
+  }
+  if (!ALLOWED_CHAINS.has(Number(siwe.chainId))) {
+    return res.status(400).json({ ok: false, code: "CHAIN_NOT_ALLOWED" });
+  }
+  if (!withinAge(siwe.issuedAt)) {
+    return res.status(400).json({ ok: false, code: "MESSAGE_TOO_OLD" });
+  }
+  if (siwe.nonce !== cookieNonce) {
+    return res.status(401).json({ ok: false, code: "NONCE_MISMATCH" });
+  }
 
   // Signatur prüfen
   const ethersMod = await import("ethers");
@@ -123,10 +133,13 @@ async function handler(req, res) {
     ethersMod.verifyMessage ||
     (ethersMod.default && ethersMod.default.verifyMessage) ||
     (ethersMod.utils && ethersMod.utils.verifyMessage);
-  if (typeof verify !== "function") return res.status(500).json({ ok: false, code: "VERIFY_UNAVAILABLE" });
-
+  if (typeof verify !== "function") {
+    return res.status(500).json({ ok: false, code: "VERIFY_UNAVAILABLE" });
+  }
   const recovered = await verify(message, signature);
-  if (!addrEq(recovered, siwe.address)) return res.status(401).json({ ok: false, code: "ADDRESS_MISMATCH" });
+  if (!addrEq(recovered, siwe.address)) {
+    return res.status(401).json({ ok: false, code: "ADDRESS_MISMATCH" });
+  }
 
   // Supabase Admin
   const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -150,7 +163,7 @@ async function handler(req, res) {
     }
   }
 
-  // 2) Wallet-Row holen
+  // 2) Wallet-Row holen (user_id, falls schon verknüpft)
   const { data: walletRow, error: wErr } = await sb
     .from("wallets")
     .select("address,user_id")
@@ -165,9 +178,10 @@ async function handler(req, res) {
 
   // 3) Falls kein Profile verlinkt → erstellen
   if (!profileId) {
+    const insertPayload = creatorName ? { creator_name: creatorName } : {};
     const { data: prof, error: pErr } = await sb
       .from("profiles")
-      .insert(creatorName ? { creator_name: creatorName } : {})
+      .insert(insertPayload)
       .select("id")
       .single();
     if (pErr) {
@@ -190,14 +204,17 @@ async function handler(req, res) {
     await sb.from("profiles").update({ creator_name: creatorName }).eq("id", profileId);
   }
 
-  // 5) Nonce ist single-use
-  clearCookie(res, COOKIE_NONCE);
+  // 5) Nonce bewusst NICHT löschen → /verify kann dieselbe Signatur verwenden.
+  //    => Ein einziges MetaMask-Popup beim Sign-Up.
+  //    // clearCookie(res, COOKIE_NONCE);  <-- ABSICHTLICH ENTFERNT
 
+  res.setHeader("Cache-Control", "no-store");
   return res.status(200).json({
     ok: true,
     registered: true,
     address: addressLower,
     userId: profileId ?? null,
+    keepNonce: true, // optionales Hint für den Client (keine Logik nötig)
   });
 }
 
