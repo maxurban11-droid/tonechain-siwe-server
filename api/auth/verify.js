@@ -1,4 +1,4 @@
-// /api/auth/verify.js  — stabile SIWE-Verify-Route mit Registrierungscheck (Node runtime)
+// /api/auth/verify.js  — stabile SIWE-Verify-Route mit Registrierungs-/Link-Option (Node runtime)
 
 import crypto from "node:crypto";
 
@@ -46,13 +46,13 @@ function setCookie(res, name, value, opts = {}) {
   parts.push("HttpOnly");
   parts.push("SameSite=None");
   parts.push("Secure");
-  parts.push("Partitioned"); // <— neu
+  parts.push("Partitioned");
   const prev = res.getHeader("Set-Cookie");
   const out = [...(Array.isArray(prev) ? prev : prev ? [String(prev)] : []), parts.join("; ")];
   res.setHeader("Set-Cookie", out);
 }
 function clearCookie(res, name) {
-  const del = `${name}=; Path=/; Max-Age=0; HttpOnly; SameSite=None; Secure; Partitioned`; // <— neu
+  const del = `${name}=; Path=/; Max-Age=0; HttpOnly; SameSite=None; Secure; Partitioned`;
   const prev = res.getHeader("Set-Cookie");
   const out = [...(Array.isArray(prev) ? prev : prev ? [String(prev)] : []), del];
   res.setHeader("Set-Cookie", out);
@@ -85,7 +85,7 @@ function parseSiweMessage(msg) {
   const fields = {};
   for (; i < lines.length; i++) {
     const row = lines[i];
-    const idx = row.indexOf(":");
+       const idx = row.indexOf(":");
     if (idx === -1) continue;
     const k = row.slice(0, idx).trim().toLowerCase();
     const v = row.slice(idx + 1).trim();
@@ -106,23 +106,28 @@ function parseSiweMessage(msg) {
   }
   return out;
 }
+function readBearer(req) {
+  const h = req.headers.authorization || req.headers.Authorization;
+  if (!h) return null;
+  const m = String(h).match(/^Bearer\s+(.+)$/i);
+  return m ? m[1] : null;
+}
 
 /* ===== Handler ===== */
 export default async function handler(req, res) {
   const origin = req.headers.origin || "";
   const allowed = originAllowed(origin);
 
-  // --- CORS: nur whitelisted Origins spiegeln, niemals "*" bei credentials:true ---
+  // --- CORS ---
   res.setHeader("Vary", "Origin");
   if (allowed) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Access-Control-Allow-Credentials", "true");
   }
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-TC-Intent");
 
   if (req.method === "OPTIONS") {
-    // Preflight: wenn Origin nicht whitelisted ist, liefern wir 204 ohne ACAO
     setDebug(res, allowed ? "preflight-ok" : "preflight-denied");
     return res.status(204).end();
   }
@@ -131,27 +136,30 @@ export default async function handler(req, res) {
   }
 
   try {
-    // 1) Origin-Gate (nach Preflight)
     if (!allowed) {
       setDebug(res, "origin-denied");
       return res.status(403).json({ ok: false, code: "ORIGIN_NOT_ALLOWED" });
     }
 
-    // 2) Payload
+    // Intent + optionaler Supabase-Bearer (für Link-Fall)
+    const intent = String(req.headers["x-tc-intent"] || "").toLowerCase(); // "link" | "" (default)
+    const bearer = readBearer(req);
+
+    // 1) Payload
     const { message, signature } = req.body || {};
     if (!message || !signature) {
       setDebug(res, "bad-payload");
       return res.status(400).json({ ok: false, code: "INVALID_PAYLOAD" });
     }
 
-    // 3) Server-Nonce
+    // 2) Server-Nonce
     const cookieNonce = getCookie(req, COOKIE_NONCE);
     if (!cookieNonce) {
       setDebug(res, "missing-nonce");
       return res.status(400).json({ ok: false, code: "MISSING_SERVER_NONCE" });
     }
 
-    // 4) SIWE parse + Checks
+    // 3) SIWE parse + Checks
     const siwe = parseSiweMessage(message);
     if (!siwe) {
       setDebug(res, "siwe-parse-failed");
@@ -184,7 +192,7 @@ export default async function handler(req, res) {
       return res.status(401).json({ ok: false, code: "NONCE_MISMATCH" });
     }
 
-    // 5) Signatur prüfen (ethers dynamisch laden)
+    // 4) Signatur prüfen
     setDebug(res, "stage:ethers-verify");
     const ethersMod = await import("ethers");
     const verify =
@@ -201,7 +209,7 @@ export default async function handler(req, res) {
       return res.status(401).json({ ok: false, code: "ADDRESS_MISMATCH" });
     }
 
-    // 6) Supabase Admin erst jetzt initialisieren
+    // 5) Supabase Admin init
     setDebug(res, "stage:db-init");
     const SUPABASE_URL = process.env.SUPABASE_URL;
     const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -209,26 +217,10 @@ export default async function handler(req, res) {
       setDebug(res, "db-env-missing");
       return res.status(500).json({ ok: false, code: "SERVER_CONFIG_MISSING" });
     }
+    const { createClient } = await import("@supabase/supabase-js");
+    const sbAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
 
-    let createClient;
-    try {
-      ({ createClient } = await import("@supabase/supabase-js"));
-    } catch (e) {
-      console.error("[SIWE] import @supabase/supabase-js failed:", e);
-      setDebug(res, "db-import-failed");
-      return res.status(500).json({ ok: false, code: "DB_INIT_ERROR" });
-    }
-
-    let sbAdmin;
-    try {
-      sbAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
-    } catch (e) {
-      console.error("[SIWE] createClient failed:", e);
-      setDebug(res, "db-client-failed");
-      return res.status(500).json({ ok: false, code: "DB_INIT_ERROR" });
-    }
-
-    // 7) Registrierung prüfen
+    // 6) Registrierung prüfen
     setDebug(res, "stage:db-check");
     const addressLower = String(siwe.address || "").toLowerCase();
     const { data: isRegistered, error: regErr } = await sbAdmin.rpc("wallet_registered", { p_address: addressLower });
@@ -237,28 +229,97 @@ export default async function handler(req, res) {
       setDebug(res, "db-rpc-error");
       return res.status(500).json({ ok: false, code: "DB_RPC_ERROR" });
     }
-    // Wallet nicht registriert -> Nonce NICHT löschen.
-// Der Client nutzt denselben Nonce direkt für /register.
-     if (!isRegistered) {
-    setDebug(res, "wallet-not-registered");
-    return res.status(403).json({
-    ok: false,
-    code: "WALLET_NOT_REGISTERED",
-    message: "No account found for this wallet. Please sign up first.",
-   });
-}
 
-    // 8) user_id lookup (optional für Session)
     let userId = null;
-    try {
-      const { data: row } = await sbAdmin
+
+    // 6a) OPTIONALER LINK-FALL: Wallet noch nicht registriert, aber wir dürfen linken
+    if (!isRegistered && intent === "link" && bearer) {
+      setDebug(res, "stage:link-mode");
+
+      // Auth-User aus Bearer ermitteln
+      const { data: authData, error: authErr } = await sbAdmin.auth.getUser(bearer);
+      if (authErr || !authData?.user?.id) {
+        setDebug(res, "link-auth-invalid");
+        return res.status(403).json({ ok: false, code: "LINK_REQUIRES_VALID_BEARER" });
+      }
+      const authUserId = authData.user.id;
+
+      // Profil zu diesem E-Mail-User finden/erzeugen
+      let linkProfileId = null;
+      const { data: existingProfile } = await sbAdmin
+        .from("profiles").select("id").eq("user_id", authUserId).maybeSingle();
+      if (existingProfile?.id) {
+        linkProfileId = existingProfile.id;
+      } else {
+        const { data: profNew, error: pErr } = await sbAdmin
+          .from("profiles").insert({ user_id: authUserId }).select("id").single();
+        if (pErr) {
+          console.error("[verify:link] create profile failed:", pErr);
+          return res.status(500).json({ ok: false, code: "PROFILE_CREATE_ERROR" });
+        }
+        linkProfileId = profNew.id;
+      }
+
+      // Wallet upsert (falls noch nicht vorhanden)
+      const { error: upErr } = await sbAdmin
+        .from("wallets").upsert({ address: addressLower }, { onConflict: "address" });
+      if (upErr) {
+        console.error("[verify:link] wallets upsert failed:", upErr);
+        return res.status(500).json({ ok: false, code: "DB_UPSERT_ERROR" });
+      }
+
+      // Wallet-Row ziehen
+      const { data: walletRow, error: wErr } = await sbAdmin
         .from("wallets").select("user_id").eq("address", addressLower).maybeSingle();
-      userId = row?.user_id ?? null;
-    } catch (e) {
-      console.warn("[SIWE] wallets lookup failed:", e);
+      if (wErr) {
+        console.error("[verify:link] wallets select failed:", wErr);
+        return res.status(500).json({ ok: false, code: "DB_SELECT_ERROR" });
+      }
+
+      // Konflikt, falls schon an anderes Profil gebunden
+      if (walletRow?.user_id && walletRow.user_id !== linkProfileId) {
+        return res.status(409).json({
+          ok: false,
+          code: "WALLET_ALREADY_LINKED",
+          message: "This wallet is already linked to another profile.",
+        });
+      }
+
+      // Verlinken
+      if (!walletRow?.user_id) {
+        const { error: linkErr } = await sbAdmin
+          .from("wallets").update({ user_id: linkProfileId }).eq("address", addressLower);
+        if (linkErr) {
+          console.error("[verify:link] link wallet->profile failed:", linkErr);
+          return res.status(500).json({ ok: false, code: "LINK_ERROR" });
+        }
+      }
+
+      userId = linkProfileId; // für Session
     }
 
-    // 9) Session setzen
+    // 6b) Wenn weiterhin nicht registriert (kein Link-Fall) -> Client soll /register nutzen
+    if (!isRegistered && !userId) {
+      setDebug(res, "wallet-not-registered");
+      return res.status(403).json({
+        ok: false,
+        code: "WALLET_NOT_REGISTERED",
+        message: "No account found for this wallet. Please sign up first.",
+      });
+    }
+
+    // 7) user_id lookup (Falls registriert war; im Link-Fall oben bereits gesetzt)
+    if (!userId) {
+      try {
+        const { data: row } = await sbAdmin
+          .from("wallets").select("user_id").eq("address", addressLower).maybeSingle();
+        userId = row?.user_id ?? null;
+      } catch (e) {
+        console.warn("[SIWE] wallets lookup failed:", e);
+      }
+    }
+
+    // 8) Session setzen
     setDebug(res, "stage:set-session");
     const payload = {
       v: 1,
@@ -271,11 +332,11 @@ export default async function handler(req, res) {
     const sig = sign(raw);
     const sessionValue = Buffer.from(JSON.stringify(sig ? { raw, sig } : { raw })).toString("base64");
 
-    clearCookie(res, COOKIE_NONCE);
+    clearCookie(res, COOKIE_NONCE); // Nonce verbraucht
     setCookie(res, COOKIE_SESSION, sessionValue, { maxAgeSec: SESSION_TTL_SEC });
 
     setDebug(res, "ok");
-    return res.status(200).json({ ok: true, address: addressLower, userId });
+    return res.status(200).json({ ok: true, address: addressLower, userId, linked: intent === "link" });
   } catch (e) {
     console.error("[SIWE verify] unexpected error:", e);
     setDebug(res, "unexpected");
@@ -283,5 +344,5 @@ export default async function handler(req, res) {
   }
 }
 
-// Sicherstellen, dass es NICHT als Edge läuft
+// Nicht als Edge laufen lassen
 export const config = { runtime: "nodejs" };
