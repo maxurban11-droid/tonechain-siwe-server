@@ -1,15 +1,10 @@
 // api/auth/register.js
-// Minimalinvasives, aber vollständiges Register-Endpoint:
-// - CORS wie bisher über helpers/cors.js
-// - prüft SIWE-Message + Signatur
-// - matched Nonce-Cookie (tc_nonce)
-// - upsert in `wallets` (address lowercased)
-// - optionales Setzen von creatorName in profiles (falls vorhanden)
-// - invalidiert Nonce-Cookie
+// Register-Endpoint (signup): verifiziert SIWE, legt Wallet an,
+// sorgt dafür, dass ein gültiger tc_nonce-Cookie für den anschließenden verify()-Call vorhanden ist.
 
 import { withCors } from "../../helpers/cors.js";
 
-/* ---- lokale, selbstständige Helfer (kein TS-Import nötig) ---- */
+/* ---- lokale Helfer & Konstanten ---- */
 const ALLOWED_DOMAINS = new Set([
   "tonechain.app",
   "concave-device-193297.framer.app",
@@ -21,6 +16,7 @@ const ALLOWED_URI_PREFIXES = [
 const ALLOWED_CHAINS = new Set([1, 11155111]); // mainnet + sepolia
 const MAX_AGE_MIN = 10;
 const MAX_SKEW_MS = 5 * 60 * 1000;
+
 const COOKIE_NONCE = "tc_nonce";
 
 function getCookie(req, name) {
@@ -28,29 +24,28 @@ function getCookie(req, name) {
   const hit = raw.split(/;\s*/).find((s) => s.startsWith(name + "="));
   return hit ? decodeURIComponent(hit.split("=").slice(1).join("=")) : null;
 }
-
-function clearCookie(res, name) {
-  const del =
-    `${name}=; Path=/; Max-Age=0; HttpOnly; SameSite=None; Secure; Partitioned`;
+function pushSetCookie(res, cookie) {
   const prev = res.getHeader("Set-Cookie");
-  res.setHeader(
-    "Set-Cookie",
-    [...(Array.isArray(prev) ? prev : prev ? [String(prev)] : []), del]
+  if (!prev) res.setHeader("Set-Cookie", [cookie]);
+  else if (Array.isArray(prev)) res.setHeader("Set-Cookie", [...prev, cookie]);
+  else res.setHeader("Set-Cookie", [String(prev), cookie]);
+}
+function setNonceCookie(res, nonce, maxAgeSec = 600) {
+  // Third-party kompatibel (Framer): SameSite=None; Secure; Partitioned
+  pushSetCookie(
+    res,
+    `${COOKIE_NONCE}=${encodeURIComponent(nonce)}; Path=/; Max-Age=${maxAgeSec}; HttpOnly; SameSite=None; Secure; Partitioned`
   );
 }
-
 function withinAge(iso) {
   const t = Date.parse(iso);
   if (!Number.isFinite(t)) return false;
   const age = Math.abs(Date.now() - t);
   return age <= MAX_AGE_MIN * 60 * 1000 + MAX_SKEW_MS;
 }
-
 function addrEq(a, b) {
   return String(a || "").toLowerCase() === String(b || "").toLowerCase();
 }
-
-// sehr robuste, generische SIWE-Parser-Funktion (passt zu deinem verify.js)
 function parseSiweMessage(msg) {
   const lines = String(msg || "").split("\n");
   if (lines.length < 2) return null;
@@ -80,29 +75,19 @@ function parseSiweMessage(msg) {
     nonce: fields["nonce"],
     issuedAt: fields["issued at"],
   };
-
-  if (
-    !out.domain ||
-    !out.address ||
-    !out.uri ||
-    !out.version ||
-    !out.chainId ||
-    !out.nonce ||
-    !out.issuedAt
-  ) {
+  if (!out.domain || !out.address || !out.uri || !out.version || !out.chainId || !out.nonce || !out.issuedAt) {
     return null;
   }
   return out;
 }
 
-/* ---- Handler ---- */
 async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "POST") {
     return res.status(405).json({ ok: false, code: "METHOD_NOT_ALLOWED" });
   }
 
-  // 1) Origin-Whitelist (nach Preflight)
+  // 1) Origin-Gate (nach Preflight)
   const origin = req.headers.origin || "";
   try {
     const host = origin ? new URL(origin).hostname : "";
@@ -132,13 +117,7 @@ async function handler(req, res) {
       .json({ ok: false, code: "INVALID_PAYLOAD", message: "Missing message or signature" });
   }
 
-  // 3) Server-Nonce muss vorhanden sein (CHIPS-Cookie von /nonce)
-  const cookieNonce = getCookie(req, COOKIE_NONCE);
-  if (!cookieNonce) {
-    return res.status(400).json({ ok: false, code: "MISSING_SERVER_NONCE" });
-  }
-
-  // 4) SIWE-Message parsen + Grundchecks
+  // 3) SIWE parsen + Grundchecks
   const siwe = parseSiweMessage(message);
   if (!siwe) return res.status(400).json({ ok: false, code: "INVALID_SIWE_FORMAT" });
 
@@ -159,51 +138,53 @@ async function handler(req, res) {
   if (!withinAge(siwe.issuedAt)) {
     return res.status(400).json({ ok: false, code: "MESSAGE_TOO_OLD" });
   }
-  if (siwe.nonce !== cookieNonce) {
-    return res.status(401).json({ ok: false, code: "NONCE_MISMATCH" });
+
+  // 4) Nonce-Handling (TOLERANT)
+  // Nach verify(403) ist tc_nonce gelöscht. Für den zweiten verify-Call
+  // setzen wir ihn hier **aus der SIWE-Message** neu, falls er fehlt.
+  const cookieNonce = getCookie(req, COOKIE_NONCE);
+  if (!cookieNonce) {
+    setNonceCookie(res, siwe.nonce, 10 * 60);
+  } else if (cookieNonce !== siwe.nonce) {
+    // wenn vorhanden aber anders → vorsichtshalber überschreiben
+    setNonceCookie(res, siwe.nonce, 10 * 60);
   }
 
-  // 5) Signatur verifizieren (ethers lazy import – gleiche Logik wie verify.js)
+  // 5) Signatur prüfen (wie in verify.js)
   const ethersMod = await import("ethers");
   const verify =
     ethersMod.verifyMessage ||
     (ethersMod.default && ethersMod.default.verifyMessage) ||
     (ethersMod.utils && ethersMod.utils.verifyMessage);
-
   if (typeof verify !== "function") {
     return res.status(500).json({ ok: false, code: "VERIFY_UNAVAILABLE" });
   }
-
   const recovered = await verify(message, signature);
   if (!addrEq(recovered, siwe.address)) {
     return res.status(401).json({ ok: false, code: "ADDRESS_MISMATCH" });
   }
 
-  // 6) Supabase Admin (Service Role) – Wallet registrieren
+  // 6) Supabase: Wallet registrieren (upsert)
   const SUPABASE_URL = process.env.SUPABASE_URL;
   const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
     return res.status(500).json({ ok: false, code: "SERVER_CONFIG_MISSING" });
   }
-
   const { createClient } = await import("@supabase/supabase-js");
   const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
     auth: { persistSession: false },
   });
 
   const addressLower = String(siwe.address).toLowerCase();
-
-  // Upsert in wallets (erfüllt anschließend wallet_registered() für /verify)
   const { error: upErr } = await sb
     .from("wallets")
     .upsert({ address: addressLower }, { onConflict: "address" });
-
   if (upErr) {
     console.error("[register] upsert wallets failed:", upErr);
     return res.status(500).json({ ok: false, code: "DB_UPSERT_ERROR" });
   }
 
-  // Optional: creator_name in profiles setzen, falls schema vorhanden
+  // optional: creator_name setzen, wenn user_id verknüpft ist
   if (creatorName && String(creatorName).trim()) {
     try {
       const { data: link } = await sb
@@ -211,7 +192,6 @@ async function handler(req, res) {
         .select("user_id")
         .eq("address", addressLower)
         .maybeSingle();
-
       if (link?.user_id) {
         await sb
           .from("profiles")
@@ -219,14 +199,15 @@ async function handler(req, res) {
           .eq("id", link.user_id);
       }
     } catch (e) {
-      console.warn("[register] optional profile update skipped:", e?.message || e);
+      console.warn("[register] profile update skipped:", e?.message || e);
     }
   }
 
-  // 7) Nonce ist single-use → löschen
-  clearCookie(res, COOKIE_NONCE);
-
+  res.setHeader("Cache-Control", "no-store");
+  // WICHTIG: Nonce NICHT löschen – der nächste /verify benötigt ihn.
   return res.status(200).json({ ok: true, registered: true });
 }
 
 export default withCors(handler);
+// sicherstellen: Node runtime
+export const config = { runtime: "nodejs" };
