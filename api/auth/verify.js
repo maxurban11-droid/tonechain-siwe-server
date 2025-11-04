@@ -46,12 +46,13 @@ function setCookie(res, name, value, opts = {}) {
   parts.push("HttpOnly");
   parts.push("SameSite=None");
   parts.push("Secure");
+  parts.push("Partitioned"); // <— neu
   const prev = res.getHeader("Set-Cookie");
   const out = [...(Array.isArray(prev) ? prev : prev ? [String(prev)] : []), parts.join("; ")];
   res.setHeader("Set-Cookie", out);
 }
 function clearCookie(res, name) {
-  const del = `${name}=; Path=/; Max-Age=0; HttpOnly; SameSite=None; Secure`;
+  const del = `${name}=; Path=/; Max-Age=0; HttpOnly; SameSite=None; Secure; Partitioned`; // <— neu
   const prev = res.getHeader("Set-Cookie");
   const out = [...(Array.isArray(prev) ? prev : prev ? [String(prev)] : []), del];
   res.setHeader("Set-Cookie", out);
