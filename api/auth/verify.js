@@ -1,4 +1,4 @@
-// /api/auth/verify.js — SIWE-Verify mit Link-Option & Schutz vor Doppelkonten (Node runtime)
+// /api/auth/verify.js — SIWE-Verify mit Link-Option & striktem Doppelkonto-Schutz (Node runtime)
 import crypto from "node:crypto";
 
 /* ===== Konfiguration ===== */
@@ -52,6 +52,15 @@ function clearCookie(res, name) {
   const del = `${name}=; Path=/; Max-Age=0; HttpOnly; SameSite=None; Secure; Partitioned`;
   const prev = res.getHeader("Set-Cookie");
   res.setHeader("Set-Cookie", [...(Array.isArray(prev) ? prev : prev ? [String(prev)] : []), del]);
+}
+
+// Einheitliche Ablehnung: sorgt IMMER dafür, dass alte Cookies entfernt werden.
+function deny(res, status, body) {
+  try {
+    clearCookie(res, COOKIE_SESSION);
+    clearCookie(res, COOKIE_NONCE);
+  } catch {}
+  return res.status(status).json(body);
 }
 
 function getCookie(req, name) {
@@ -123,15 +132,15 @@ export default async function handler(req, res) {
     res.setHeader("Access-Control-Allow-Credentials", "true");
   }
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  // beide Schreibweisen von X-TC-Intent zulassen (einige Envs prüfen exakt)
+  // beide Schreibweisen zulassen
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-TC-Intent, x-tc-intent");
 
   if (req.method === "OPTIONS") {
     setDebug(res, allowed ? "preflight-ok" : "preflight-denied");
     return res.status(204).end();
   }
-  if (req.method !== "POST") return res.status(405).json({ ok: false, code: "METHOD_NOT_ALLOWED" });
-  if (!allowed) return res.status(403).json({ ok: false, code: "ORIGIN_NOT_ALLOWED" });
+  if (req.method !== "POST") return deny(res, 405, { ok: false, code: "METHOD_NOT_ALLOWED" });
+  if (!allowed) return deny(res, 403, { ok: false, code: "ORIGIN_NOT_ALLOWED" });
 
   try {
     const intent = String(req.headers["x-tc-intent"] || req.headers["X-TC-Intent"] || "").toLowerCase(); // "link" | ""
@@ -139,117 +148,213 @@ export default async function handler(req, res) {
 
     // 1) Payload
     const { message, signature } = req.body || {};
-    if (!message || !signature) return res.status(400).json({ ok: false, code: "INVALID_PAYLOAD" });
+    if (!message || !signature) return deny(res, 400, { ok: false, code: "INVALID_PAYLOAD" });
 
     // 2) Server-Nonce
     const cookieNonce = getCookie(req, COOKIE_NONCE);
-    if (!cookieNonce) return res.status(400).json({ ok: false, code: "MISSING_SERVER_NONCE" });
+    if (!cookieNonce) return deny(res, 400, { ok: false, code: "MISSING_SERVER_NONCE" });
 
     // 3) SIWE parse + Checks
     const siwe = parseSiweMessage(message);
-    if (!siwe) return res.status(400).json({ ok: false, code: "INVALID_SIWE_FORMAT" });
-    if (!ALLOWED_DOMAINS.has(siwe.domain)) return res.status(400).json({ ok: false, code: "DOMAIN_NOT_ALLOWED" });
+    if (!siwe) return deny(res, 400, { ok: false, code: "INVALID_SIWE_FORMAT" });
+    if (!ALLOWED_DOMAINS.has(siwe.domain)) return deny(res, 400, { ok: false, code: "DOMAIN_NOT_ALLOWED" });
     try {
       const u = new URL(siwe.uri);
-      if (!ALLOWED_URI_PREFIXES.some(p => u.href.startsWith(p))) return res.status(400).json({ ok: false, code: "URI_NOT_ALLOWED" });
-    } catch { return res.status(400).json({ ok: false, code: "URI_NOT_ALLOWED" }); }
-    if (!ALLOWED_CHAINS.has(Number(siwe.chainId))) return res.status(400).json({ ok: false, code: "CHAIN_NOT_ALLOWED" });
-    if (!withinAge(siwe.issuedAt)) return res.status(400).json({ ok: false, code: "MESSAGE_TOO_OLD" });
-    if (siwe.nonce !== cookieNonce) return res.status(401).json({ ok: false, code: "NONCE_MISMATCH" });
+      if (!ALLOWED_URI_PREFIXES.some(p => u.href.startsWith(p))) return deny(res, 400, { ok: false, code: "URI_NOT_ALLOWED" });
+    } catch { return deny(res, 400, { ok: false, code: "URI_NOT_ALLOWED" }); }
+    if (!ALLOWED_CHAINS.has(Number(siwe.chainId))) return deny(res, 400, { ok: false, code: "CHAIN_NOT_ALLOWED" });
+    if (!withinAge(siwe.issuedAt)) return deny(res, 400, { ok: false, code: "MESSAGE_TOO_OLD" });
+    if (siwe.nonce !== cookieNonce) return deny(res, 401, { ok: false, code: "NONCE_MISMATCH" });
 
     // 4) Signatur prüfen
+    setDebug(res, "stage:ethers-verify");
     const ethersMod = await import("ethers");
     const verify =
       ethersMod.verifyMessage ||
       (ethersMod.default && ethersMod.default.verifyMessage) ||
       (ethersMod.utils && ethersMod.utils.verifyMessage);
-    if (typeof verify !== "function") return res.status(500).json({ ok: false, code: "VERIFY_UNAVAILABLE" });
+    if (typeof verify !== "function") return deny(res, 500, { ok: false, code: "VERIFY_UNAVAILABLE" });
 
     const recovered = await verify(message, signature);
-    if (!addrEq(recovered, siwe.address)) return res.status(401).json({ ok: false, code: "ADDRESS_MISMATCH" });
+    if (!addrEq(recovered, siwe.address)) return deny(res, 401, { ok: false, code: "ADDRESS_MISMATCH" });
 
     // 5) Supabase Admin
+    setDebug(res, "stage:db-init");
     const SUPABASE_URL = process.env.SUPABASE_URL;
     const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return res.status(500).json({ ok: false, code: "SERVER_CONFIG_MISSING" });
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return deny(res, 500, { ok: false, code: "SERVER_CONFIG_MISSING" });
     const { createClient } = await import("@supabase/supabase-js");
     const sbAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
 
     // 6) Wallet-Registrierung & Zuordnung
+    setDebug(res, "stage:db-check");
     const addressLower = String(siwe.address || "").toLowerCase();
     const { data: walletRow, error: wErr } = await sbAdmin
       .from("wallets")
-      .select("user_id")
+      .select("address,user_id")
       .eq("address", addressLower)
       .maybeSingle();
-    if (wErr) return res.status(500).json({ ok: false, code: "DB_SELECT_ERROR" });
+    if (wErr) return deny(res, 500, { ok: false, code: "DB_SELECT_ERROR" });
 
-    const isRegistered = !!walletRow;
+    let isRegistered = !!walletRow;
     let walletUserId = walletRow?.user_id ?? null;
 
     // Aktives E-Mail-Profil bestimmen (falls Bearer vorhanden)
     let emailProfileId = null;
     if (bearer) {
-      const { data: authData } = await sbAdmin.auth.getUser(bearer);
-      const authUserId = authData?.user?.id || null;
-      if (authUserId) {
-        const { data: prof } = await sbAdmin
-          .from("profiles")
-          .select("id")
-          .eq("user_id", authUserId)
-          .maybeSingle();
-        emailProfileId = prof?.id ?? null;
+      const { data: authData, error: authErr } = await sbAdmin.auth.getUser(bearer);
+      if (!authErr) {
+        const authUserId = authData?.user?.id || null;
+        if (authUserId) {
+          const { data: prof } = await sbAdmin
+            .from("profiles")
+            .select("id")
+            .eq("user_id", authUserId)
+            .maybeSingle();
+          emailProfileId = prof?.id ?? null;
+        }
       }
     }
 
-    /* ===== Link-Modus ===== */
-    /* ===== Link-Modus (Wallet mit aktivem E-Mail-Profil verknüpfen) ===== */
-if (intent === "link") {
-  if (!bearer || !emailProfileId) {
-    return res
-      .status(403)
-      .json({ ok: false, code: "LINK_REQUIRES_VALID_BEARER" });
-  }
+    /* ===== LINK-MODUS ===== */
+    if (intent === "link") {
+      if (!bearer || !emailProfileId) {
+        return deny(res, 403, { ok: false, code: "LINK_REQUIRES_VALID_BEARER" });
+      }
 
-  // Wenn die Wallet schon einem ANDEREN Profil gehört → sofort blocken
-  if (walletUserId && walletUserId !== emailProfileId) {
-    return res.status(409).json({
-      ok: false,
-      code: "WALLET_ALREADY_LINKED",
-      message: "This wallet is already linked to another profile.",
-    });
-  }
+      // Wallet gehört bereits einem ANDEREN Profil → block
+      if (walletUserId && walletUserId !== emailProfileId) {
+        return deny(res, 409, {
+          ok: false,
+          code: "WALLET_ALREADY_LINKED",
+          message: "This wallet is already linked to another profile.",
+        });
+      }
 
-  // ✅ ATOMISCH in der DB verlinken (oder erstellen+verlinken):
-  // - Unclaimed (user_id IS NULL)  → link to emailProfileId
-  // - Bereits dem gleichen Profil  → idempotent OK
-  // - Bereits anderem Profil       → RPC wirft 'WALLET_ALREADY_LINKED'
-  const { error: rpcErr } = await sbAdmin.rpc("link_wallet_to_profile", {
-    p_address: addressLower,
-    p_profile_id: emailProfileId,
-  });
+      // 6a) Versuch: atomisch per RPC (falls vorhanden)
+      let linked = false;
+      try {
+        const { error: rpcErr } = await sbAdmin.rpc("link_wallet_to_profile", {
+          p_address: addressLower,
+          p_profile_id: emailProfileId,
+        });
+        if (rpcErr) {
+          const msg = (rpcErr.message || "").toLowerCase();
+          if (msg.includes("wallet_already_linked")) {
+            return deny(res, 409, {
+              ok: false,
+              code: "WALLET_ALREADY_LINKED",
+              message: "This wallet is already linked to another profile.",
+            });
+          }
+          // Wenn die Funktion nicht existiert, fällt es in den Fallback unten
+          if (!msg.includes("function") && !msg.includes("procedure")) {
+            // echter Fehler
+            console.error("[verify:link] RPC failed:", rpcErr);
+            return deny(res, 500, { ok: false, code: "DB_LINK_RPC_ERROR" });
+          }
+        } else {
+          linked = true;
+        }
+      } catch {
+        // ignorieren → Fallback
+      }
 
-  if (rpcErr) {
-    const msg = (rpcErr.message || "").toLowerCase();
-    if (msg.includes("wallet_already_linked")) {
-      return res.status(409).json({
-        ok: false,
-        code: "WALLET_ALREADY_LINKED",
-        message: "This wallet is already linked to another profile.",
-      });
+      // 6b) Fallback ohne RPC: sicherer 2-Phasen-Flow ohne Fremdüberschreibung
+      if (!linked) {
+        if (!isRegistered) {
+          // Insert versuchen
+          const { error: insErr } = await sbAdmin
+            .from("wallets")
+            .insert({ address: addressLower, user_id: emailProfileId });
+          if (insErr) {
+            // Kann Konflikt sein (unique address) -> reselect und prüfen
+            const { data: again } = await sbAdmin
+              .from("wallets")
+              .select("address,user_id")
+              .eq("address", addressLower)
+              .maybeSingle();
+            const uid = again?.user_id ?? null;
+            if (uid && uid !== emailProfileId) {
+              return deny(res, 409, {
+                ok: false,
+                code: "WALLET_ALREADY_LINKED",
+                message: "This wallet is already linked to another profile.",
+              });
+            }
+            if (!uid) {
+              return deny(res, 500, { ok: false, code: "DB_UPSERT_ERROR" });
+            }
+          }
+          isRegistered = true;
+          walletUserId = emailProfileId;
+        } else if (!walletUserId) {
+          // Nur verlinken, wenn derzeit unclaimed
+          const { data: upd, error: linkErr } = await sbAdmin
+            .from("wallets")
+            .update({ user_id: emailProfileId })
+            .eq("address", addressLower)
+            .is("user_id", null)
+            .select("user_id"); // damit wir sehen, ob was passiert ist
+          if (linkErr) {
+            return deny(res, 500, { ok: false, code: "LINK_ERROR" });
+          }
+          // Wenn nichts updatet wurde, prüfen ob inzw. jemand anders verlinkt hat
+          if (!upd || upd.length === 0) {
+            const { data: again } = await sbAdmin
+              .from("wallets")
+              .select("address,user_id")
+              .eq("address", addressLower)
+              .maybeSingle();
+            const uid = again?.user_id ?? null;
+            if (uid && uid !== emailProfileId) {
+              return deny(res, 409, {
+                ok: false,
+                code: "WALLET_ALREADY_LINKED",
+                message: "This wallet is already linked to another profile.",
+              });
+            }
+            if (!uid) {
+              return deny(res, 500, { ok: false, code: "LINK_ERROR" });
+            }
+          }
+          walletUserId = emailProfileId;
+        } else {
+          // walletUserId === emailProfileId → idempotent OK
+        }
+      }
+      // -> fällt unten in die Session-Setzung
     }
-    console.error("[verify:link] RPC failed:", rpcErr);
-    return res
-      .status(500)
-      .json({ ok: false, code: "DB_LINK_RPC_ERROR" });
-  }
 
-  // Erfolgreich gelinkt → im laufenden Request die Zuordnung spiegeln
-  walletUserId = emailProfileId;
-  // (fällt unten in die Session-Setzung)
-}
+    /* ===== NORMALER MODUS (kein link) ===== */
+    if (intent !== "link") {
+      // Wallet existiert nicht → block (Sign-up/Link zuerst)
+      if (!isRegistered) {
+        return deny(res, 403, {
+          ok: false,
+          code: "WALLET_NOT_REGISTERED",
+          message: "No account found for this wallet. Please sign up or link first.",
+        });
+      }
+      // Wallet existiert, aber ohne Zuordnung → block (nur Link-Modus darf verknüpfen)
+      if (!walletUserId) {
+        return deny(res, 409, {
+          ok: false,
+          code: "WALLET_UNASSIGNED",
+          message: "This wallet is not linked to any profile yet. Use Link mode.",
+        });
+      }
+      // Falls eine E-Mail-Session aktiv ist, muss sie mit der Wallet übereinstimmen
+      if (emailProfileId && walletUserId !== emailProfileId) {
+        return deny(res, 409, {
+          ok: false,
+          code: "OTHER_ACCOUNT_ACTIVE",
+          message: "Another account is active via email. Use Link mode.",
+        });
+      }
+    }
 
-    // 7) user_id ggf. nachschlagen (wenn registriert; im Link-Fall oben gesetzt)
+    // 7) user_id final bestimmen
     let userId = walletUserId ?? null;
     if (!userId && isRegistered) {
       const { data: row2 } = await sbAdmin
@@ -260,11 +365,21 @@ if (intent === "link") {
       userId = row2?.user_id ?? null;
     }
 
-    // 8) SIWE-Session Cookie setzen
+    // Sicherheitsnetz: OHNE userId KEINE Session
+    if (!userId) {
+      return deny(res, 403, {
+        ok: false,
+        code: "NO_USER_FOR_WALLET",
+        message: "Wallet has no associated user. Link required.",
+      });
+    }
+
+    // 8) SIWE-Session Cookie setzen (nur jetzt, da userId valide)
+    setDebug(res, "stage:set-session");
     const payload = {
       v: 1,
       addr: addressLower,
-      userId: userId ?? null,
+      userId,
       ts: Date.now(),
       exp: Date.now() + SESSION_TTL_SEC * 1000,
     };
@@ -279,13 +394,13 @@ if (intent === "link") {
     return res.status(200).json({
       ok: true,
       address: addressLower,
-      userId: userId ?? null,
+      userId,
       linked: intent === "link",
     });
   } catch (e) {
     console.error("[SIWE verify] unexpected error:", e);
     setDebug(res, "unexpected");
-    return res.status(500).json({ ok: false, code: "INTERNAL_ERROR" });
+    return deny(res, 500, { ok: false, code: "INTERNAL_ERROR" });
   }
 }
 
