@@ -1,5 +1,5 @@
 // pages/api/auth/check-email.js
-import { withCors } from "../../../helpers/cors.js"; // Pfad stimmt: pages/api/auth -> helpers/cors.js
+import { withCors } from "../../helpers/cors.js"; // Pfad stimmt: pages/api/auth -> helpers/cors.js
 
 /**
  * Prüft, ob eine E-Mail in Supabase Auth existiert
