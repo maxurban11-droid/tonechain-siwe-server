@@ -203,66 +203,51 @@ export default async function handler(req, res) {
     }
 
     /* ===== Link-Modus ===== */
-    if (intent === "link") {
-      if (!bearer || !emailProfileId) {
-        return res.status(403).json({ ok: false, code: "LINK_REQUIRES_VALID_BEARER" });
-      }
+    /* ===== Link-Modus (Wallet mit aktivem E-Mail-Profil verknüpfen) ===== */
+if (intent === "link") {
+  if (!bearer || !emailProfileId) {
+    return res
+      .status(403)
+      .json({ ok: false, code: "LINK_REQUIRES_VALID_BEARER" });
+  }
 
-      // Wallet bereits an anderes Profil gebunden?
-      if (walletUserId && walletUserId !== emailProfileId) {
-        return res.status(409).json({
-          ok: false,
-          code: "WALLET_ALREADY_LINKED",
-          message: "This wallet is already linked to another profile.",
-        });
-      }
+  // Wenn die Wallet schon einem ANDEREN Profil gehört → sofort blocken
+  if (walletUserId && walletUserId !== emailProfileId) {
+    return res.status(409).json({
+      ok: false,
+      code: "WALLET_ALREADY_LINKED",
+      message: "This wallet is already linked to another profile.",
+    });
+  }
 
-      // Upsert + Verknüpfen (falls nötig)
-      if (!isRegistered) {
-        const { error: upErr } = await sbAdmin
-          .from("wallets")
-          .upsert({ address: addressLower, user_id: emailProfileId }, { onConflict: "address" });
-        if (upErr) return res.status(500).json({ ok: false, code: "DB_UPSERT_ERROR" });
-        walletUserId = emailProfileId;
-      } else if (!walletUserId) {
-        const { error: linkErr } = await sbAdmin
-          .from("wallets")
-          .update({ user_id: emailProfileId })
-          .eq("address", addressLower);
-        if (linkErr) return res.status(500).json({ ok: false, code: "LINK_ERROR" });
-        walletUserId = emailProfileId;
-      }
-      // -> fällt unten in die Session-Setzung
+  // ✅ ATOMISCH in der DB verlinken (oder erstellen+verlinken):
+  // - Unclaimed (user_id IS NULL)  → link to emailProfileId
+  // - Bereits dem gleichen Profil  → idempotent OK
+  // - Bereits anderem Profil       → RPC wirft 'WALLET_ALREADY_LINKED'
+  const { error: rpcErr } = await sbAdmin.rpc("link_wallet_to_profile", {
+    p_address: addressLower,
+    p_profile_id: emailProfileId,
+  });
+
+  if (rpcErr) {
+    const msg = (rpcErr.message || "").toLowerCase();
+    if (msg.includes("wallet_already_linked")) {
+      return res.status(409).json({
+        ok: false,
+        code: "WALLET_ALREADY_LINKED",
+        message: "This wallet is already linked to another profile.",
+      });
     }
+    console.error("[verify:link] RPC failed:", rpcErr);
+    return res
+      .status(500)
+      .json({ ok: false, code: "DB_LINK_RPC_ERROR" });
+  }
 
-    /* ===== Normaler Modus (kein link) ===== */
-    if (intent !== "link") {
-      // wallet nicht registriert -> block (Sign-Up/Link zuerst)
-      if (!isRegistered) {
-        return res.status(403).json({ ok: false, code: "WALLET_NOT_REGISTERED" });
-      }
-      // wenn E-Mail-Session aktiv ist:
-      if (emailProfileId) {
-        // Wallet gehört anderem Profil -> hart blocken
-        if (walletUserId && walletUserId !== emailProfileId) {
-          return res.status(409).json({
-            ok: false,
-            code: "OTHER_ACCOUNT_ACTIVE",
-            message: "Another account is active via email. Use Link mode to attach this wallet.",
-          });
-        }
-        // Wallet existiert, aber noch nicht verknüpft -> Link-Modus erforderlich
-        if (!walletUserId) {
-          return res.status(409).json({
-            ok: false,
-            code: "NEED_LINK_MODE",
-            message: "This wallet is not linked to your profile yet. Use Link mode.",
-          });
-        }
-        // else: walletUserId === emailProfileId -> erlaubt (gleiches Profil)
-      }
-      // kein Bearer -> klassisches SIWE-Login (bereits registrierte Wallet)
-    }
+  // Erfolgreich gelinkt → im laufenden Request die Zuordnung spiegeln
+  walletUserId = emailProfileId;
+  // (fällt unten in die Session-Setzung)
+}
 
     // 7) user_id ggf. nachschlagen (wenn registriert; im Link-Fall oben gesetzt)
     let userId = walletUserId ?? null;
