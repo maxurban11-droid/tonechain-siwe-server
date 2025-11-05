@@ -8,6 +8,40 @@ const ALLOWED_DOMAINS = new Set([
 ]);
 const CACHE_TTL_SEC = 60 * 5; // 5 Minuten
 
+// ... (CORS & Validierung wie gehabt)
+
+const auth = req.headers.authorization || "";
+const m = auth.match(/^Bearer\s+(.+)$/i);
+const bearer = m ? m[1] : null;
+
+const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
+
+let linkedToMe = undefined; // nur gesetzt, wenn Bearer vorhanden
+let myProfileId = null;
+
+if (bearer) {
+  const { data: authData } = await sb.auth.getUser(bearer);
+  const authUserId = authData?.user?.id || null;
+  if (authUserId) {
+    const { data: prof } = await sb.from("profiles").select("id").eq("user_id", authUserId).maybeSingle();
+    myProfileId = prof?.id ?? null;
+  }
+}
+
+const { data: w, error } = await sb.from("wallets").select("user_id").eq("address", address).maybeSingle();
+if (error) {
+  console.error("[exists] DB query failed:", error);
+  return res.status(500).json({ ok: false, code: "DB_ERROR" });
+}
+
+const exists = !!w;
+if (bearer) {
+  linkedToMe = exists && myProfileId ? w?.user_id === myProfileId : false;
+}
+
+res.setHeader("Cache-Control", `public, max-age=60`); // optional
+return res.status(200).json({ ok: true, exists, ...(bearer ? { linkedToMe } : {}) });
+
 /* ===== kleine Helfer ===== */
 function originAllowed(origin) {
   try {
