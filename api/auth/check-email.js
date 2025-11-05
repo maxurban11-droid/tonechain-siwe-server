@@ -1,14 +1,11 @@
-// app/api/auth/check-email/route.js
-export const runtime = "nodejs";         // wichtig: Node Runtime (admin API)
-export const dynamic = "force-dynamic";  // keine statische Zwischenspeicherung
-
-import { NextResponse } from "next/server";
+// pages/api/auth/check-email.js
+import { withCors } from "../../../helpers/cors.js";
 import { createClient } from "@supabase/supabase-js";
-import { corsHeadersForOrigin } from "../../../../helpers/cors.js";
 
 const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const service = process.env.SUPABASE_SERVICE_ROLE;
 
+// Admin-Client: nur im Servercode (Service-Role)!
 const supabaseAdmin = createClient(url, service, {
   auth: { autoRefreshToken: false, persistSession: false },
 });
@@ -17,33 +14,32 @@ function normalizeEmail(v) {
   return String(v || "").trim().toLowerCase();
 }
 
-function withCorsHeaders(origin, body, status = 200) {
-  const h = corsHeadersForOrigin(origin);
-  if (!h) return new NextResponse(JSON.stringify({ ok: false, error: "origin_not_allowed" }), { status: 403 });
-  return new NextResponse(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...h } });
-}
+async function handler(req, res) {
+  if (req.method !== "POST") {
+    return res.status(405).json({ ok: false, error: "method_not_allowed" });
+  }
 
-export async function OPTIONS(request) {
-  const origin = request.headers.get("origin") || "";
-  const h = corsHeadersForOrigin(origin);
-  return new NextResponse(null, { status: 204, headers: h ?? {} });
-}
-
-export async function POST(request) {
-  const origin = request.headers.get("origin") || "";
   try {
-    const { email } = await request.json();
+    const { email } = (req.body || {});
     const mail = normalizeEmail(email);
-    if (!mail) return withCorsHeaders(origin, { ok: false, error: "bad_input" }, 400);
+    if (!mail) return res.status(400).json({ ok: false, error: "bad_input" });
 
     // 1) Auth-User prüfen
     let user = null;
     try {
       const { data, error } = await supabaseAdmin.auth.admin.getUserByEmail(mail);
-      user = error ? null : (data?.user ?? null);
-    } catch { user = null; }
+      if (error) {
+        // z.B. wenn Mail nicht existiert
+        user = null;
+      } else {
+        user = data?.user ?? null;
+      }
+    } catch (e) {
+      // Fallback: treat as not found (keine harten Fehler nach außen)
+      user = null;
+    }
 
-    // 2) Profile prüfen
+    // 2) Profile prüfen (existiert evtl. schon ohne bestätigte Mail)
     let profile = null;
     try {
       const { data: prof } = await supabaseAdmin
@@ -52,14 +48,20 @@ export async function POST(request) {
         .or(`email.eq.${mail},user_id.eq.${user?.id ?? "00000000-0000-0000-0000-000000000000"}`)
         .maybeSingle();
       profile = prof ?? null;
-    } catch { profile = null; }
+    } catch {
+      profile = null;
+    }
 
     const exists = !!(user || profile);
-    const confirmed = !!(user && (user.email_confirmed_at || user.confirmed_at));
+    const confirmed =
+      !!(user && (user.email_confirmed_at || user.confirmed_at)); // supabase user model
 
-    return withCorsHeaders(origin, { exists, confirmed }, 200);
+    return res.status(200).json({ exists, confirmed });
   } catch (e) {
     console.error("[check-email] error:", e);
-    return withCorsHeaders(origin, { exists: false, confirmed: false }, 200);
+    // Kein Leak, aber stabile Antwort
+    return res.status(200).json({ exists: false, confirmed: false });
   }
 }
+
+export default withCors(handler);
