@@ -1,5 +1,5 @@
 // pages/api/auth/check-email.js
-import { withCors } from "../../../helpers/cors.js";
+import { withCors } from "../../helpers/cors.js";
 import { createClient } from "@supabase/supabase-js";
 
 const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
