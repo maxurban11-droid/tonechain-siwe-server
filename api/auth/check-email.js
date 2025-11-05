@@ -1,5 +1,5 @@
 // pages/api/auth/check-email.js
-import { withCors } from "../../../helpers/cors.js"; // ggf. Pfad anpassen
+import { withCors } from "../../helpers/cors.js"; // ggf. Pfad anpassen
 
 async function handler(req, res) {
   if (req.method !== "POST") {
