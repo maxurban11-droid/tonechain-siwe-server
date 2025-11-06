@@ -69,26 +69,45 @@ function matchOrigin(origin) {
 }
 
 /** Setzt CORS-Header auf Node/Express/Next (Pages-Router) Response */
+// helpers/cors.js — nur die Funktion setCorsHeaders ersetzen
+
 function setCorsHeaders(res, allowedOrigin, req) {
+  // Basis-CORS
   res.setHeader("Vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Headers");
   res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
   res.setHeader("Access-Control-Allow-Credentials", "true");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader(
-   "Access-Control-Allow-Headers",
-   "Content-Type, Authorization, X-TC-Intent, X-TC-Nonce"
- );
   res.setHeader("Access-Control-Max-Age", "600");
 
-  // reflect preflight-requested headers, fallback incl. X-TC-Intent
-  const requested = (req?.headers?.["access-control-request-headers"] ||
-                     req?.headers?.["Access-Control-Request-Headers"] ||
-                     "").toString().trim();
+  // Angefragte Header des Browsers (bei Preflight)
+  const requestedRaw =
+    (req?.headers?.["access-control-request-headers"] ||
+     req?.headers?.["Access-Control-Request-Headers"] ||
+     "").toString();
 
-  const fallback = "Content-Type, Authorization, X-TC-Intent";
-  res.setHeader("Access-Control-Allow-Headers", requested || fallback);
+  const requested = requestedRaw
+    .split(",")
+    .map(h => h.trim())
+    .filter(Boolean);
 
-  res.setHeader("Access-Control-Max-Age", "600");
+  // Pflichtliste (immer erlauben) – WICHTIG: X-TC-Nonce bleibt immer enthalten
+  const REQUIRED = ["Content-Type", "Authorization", "X-TC-Intent", "X-TC-Nonce"];
+
+  // Vereinigung bilden (Case-insensitiv tolerant)
+  const allowHeaders = Array.from(new Set([
+    ...REQUIRED,
+    ...requested
+  ])).join(", ");
+
+  res.setHeader("Access-Control-Allow-Headers", allowHeaders);
+
+  // Optionaler Debug-Header (hilft im Network-Tab)
+  try {
+    res.setHeader("X-TC-CORS", JSON.stringify({
+      allowOrigin: allowedOrigin,
+      allowHeaders
+    }));
+  } catch {}
 }
 
 /** Liefert CORS-Header-Objekt (für App Router / Edge Runtimes) */
@@ -110,6 +129,14 @@ export function corsHeadersForOrigin(origin) {
  * Nutzt die Allowlist und beantwortet OPTIONS/HEAD korrekt.
  */
 export function withCors(handler) {
+  if (req.method === "OPTIONS") {
+  if (allowed) setCorsHeaders(res, allowed, req);
+  else {
+    res.setHeader("Vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Headers");
+    res.setHeader("X-TC-CORS", "preflight-denied-origin-not-in-allowlist");
+  }
+  return res.status(204).end();
+  }
   return async (req, res) => {
     const origin = req.headers.origin || "";
     const allowed = matchOrigin(origin);
@@ -144,7 +171,7 @@ export function withCors(handler) {
 export function handleOptions(req, res) {
   const origin = req.headers.origin || "";
   const allowed = matchOrigin(origin);
-  if (allowed) setCorsHeaders(res, allowed);
+  if (allowed) setCorsHeaders(res, allowed, req); // <- req übergeben
   return res.status(204).end();
 }
 
