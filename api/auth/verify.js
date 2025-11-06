@@ -1,5 +1,7 @@
 // /api/auth/verify.js — SIWE-Verify mit Link-Option & striktem Doppelkonto-Schutz (Node runtime)
 import crypto from "node:crypto";
+import { readNonceFromReq } from "../../helpers/nonce.js";
+import { SiweMessage } from "siwe"; // falls du SIWE parse nutzt
 
 /* ===== Konfiguration ===== */
 const ALLOWED_DOMAINS = new Set([
@@ -19,6 +21,15 @@ const COOKIE_SESSION = "tc_session";
 const SESSION_TTL_SEC = 60 * 60 * 24; // 1 Tag
 
 const SESSION_SECRET = process.env.SESSION_SECRET || null;
+
+const provided = readNonceFromReq(req);        // Header oder Cookie
+const { message, signature } = req.body || {};
+const msg = new SiweMessage(message);
+const fields = await msg.verify({ signature, /* ... */ });
+// Prüfen, dass Nonce in der Message = bereitgestellte Nonce:
+if (!provided || String(fields.data.nonce) !== String(provided)) {
+  return res.status(400).json({ ok:false, code:"NONCE_MISMATCH" });
+}
 
 function setDebug(res, msg) {
   try { res.setHeader("X-TC-Debug", msg); } catch {}
