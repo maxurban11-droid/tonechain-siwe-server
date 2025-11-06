@@ -1,4 +1,3 @@
-// api/auth/check-email.js
 import { withCors } from "../../helpers/cors.js";
 import { createClient } from "@supabase/supabase-js";
 
@@ -36,7 +35,7 @@ async function findByAdminRest(base, serviceRole, email) {
 }
 
 async function findByAdminList(admin, email) {
-  // Fallback: bis zu 5 Seiten à 200 User (max. ~1000)
+  // Fallback: bis zu 5 Seiten à 200 User
   const perPage = 200;
   for (let page = 1; page <= 5; page++) {
     const { data, error } = await admin.auth.admin.listUsers({ page, perPage });
@@ -81,11 +80,12 @@ export default withCors(async function handler(req, res) {
       user = await findByAdminList(admin, email);
     }
 
+    // confirmed-Feld defensiv auswerten (verschiedene GoTrue-Versionen)
+    const confirmed = !!(user?.email_confirmed_at || user?.confirmed_at);
     const exists = !!user;
-    const confirmed = !!user?.email_confirmed_at;
 
     if (process.env.DEBUG_CHECK_EMAIL === "1") {
-      console.log("[check-email] result:", { exists, confirmed });
+      console.log("[check-email] result:", { exists, confirmed, userId: user?.id || null });
     }
 
     return res.status(200).json({ exists, confirmed });
