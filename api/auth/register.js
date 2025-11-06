@@ -1,4 +1,7 @@
-// /api/auth/register.js — SIWE Register / optional LINK (Node runtime)
+// api/auth/register.js
+// SIWE "register/link" – robustes CORS, keine Top-Level-req/res,
+// Node runtime (ethers), Nonce wird NICHT gelöscht.
+
 import { withCors } from "../../helpers/cors.js";
 
 const ALLOWED_DOMAINS = new Set(["tonechain.app", "concave-device-193297.framer.app"]);
@@ -11,20 +14,24 @@ const MAX_AGE_MIN = 10;
 const MAX_SKEW_MS = 5 * 60 * 1000;
 const COOKIE_NONCE = "tc_nonce";
 
+/* ---------- Helpers ---------- */
 function getCookie(req, name) {
   const raw = req.headers.cookie || "";
   const hit = raw.split(/;\s*/).find((s) => s.startsWith(name + "="));
   return hit ? decodeURIComponent(hit.split("=").slice(1).join("=")) : null;
 }
+
 function withinAge(iso) {
   const t = Date.parse(iso);
   if (!Number.isFinite(t)) return false;
   const age = Math.abs(Date.now() - t);
   return age <= MAX_AGE_MIN * 60 * 1000 + MAX_SKEW_MS;
 }
+
 function addrEq(a, b) {
   return String(a || "").toLowerCase() === String(b || "").toLowerCase();
 }
+
 function parseSiweMessage(msg) {
   const lines = String(msg || "").split("\n");
   if (lines.length < 2) return null;
@@ -33,6 +40,7 @@ function parseSiweMessage(msg) {
 
   let i = 2;
   while (i < lines.length && !/^[A-Za-z ]+:\s/.test(lines[i])) i++;
+
   const fields = {};
   for (; i < lines.length; i++) {
     const row = lines[i];
@@ -57,6 +65,7 @@ function parseSiweMessage(msg) {
   }
   return out;
 }
+
 function readBearer(req) {
   const h = req.headers.authorization || req.headers.Authorization;
   if (!h) return null;
@@ -64,17 +73,18 @@ function readBearer(req) {
   return m ? m[1] : null;
 }
 
-export default withCors(async function handler(req, res) {
-  if (req.method === "OPTIONS" || req.method === "HEAD") return res.status(204).end();
-  if (req.method !== "POST") return res.status(405).json({ ok:false, code:"METHOD_NOT_ALLOWED" });
+/* ---------- Handler ---------- */
+async function handler(req, res) {
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method !== "POST") return res.status(405).json({ ok: false, code: "METHOD_NOT_ALLOWED" });
 
   // Intent + Bearer
-  const intent = String(req.headers["x-tc-intent"] || req.headers["X-TC-Intent"] || "").toLowerCase(); // "link"|"signup"
+  const intent = String(req.headers["x-tc-intent"] || req.headers["X-TC-Intent"] || "").toLowerCase(); // "link"/"signup"
   const bearer = readBearer(req);
 
-  // Body
+  // Body tolerant parsen
   let body = req.body;
-  if (body == null || typeof body !== "object") {
+  if (!body || typeof body !== "object") {
     try { body = JSON.parse(req.body || "{}"); } catch { body = {}; }
   }
   const message = body?.message;
@@ -82,59 +92,57 @@ export default withCors(async function handler(req, res) {
   const creatorName = (body?.creatorName ?? "").trim() || null;
 
   if (!message || !signature) {
-    return res.status(400).json({ ok:false, code:"INVALID_PAYLOAD" });
+    return res.status(400).json({ ok: false, code: "INVALID_PAYLOAD", message: "Missing message or signature" });
   }
 
-  // Nonce aus Header ODER Cookie
-  const headerNonce = req.headers["x-tc-nonce"] || req.headers["X-TC-Nonce"] || null;
+  // Server-Nonce
   const cookieNonce = getCookie(req, COOKIE_NONCE);
-  const providedNonce = String(headerNonce || cookieNonce || "");
-  if (!providedNonce) return res.status(400).json({ ok:false, code:"MISSING_SERVER_NONCE" });
+  if (!cookieNonce) return res.status(400).json({ ok: false, code: "MISSING_SERVER_NONCE" });
 
-  // SIWE prüfen
+  // SIWE-Checks
   const siwe = parseSiweMessage(message);
-  if (!siwe) return res.status(400).json({ ok:false, code:"INVALID_SIWE_FORMAT" });
-  if (!ALLOWED_DOMAINS.has(siwe.domain)) return res.status(400).json({ ok:false, code:"DOMAIN_NOT_ALLOWED" });
+  if (!siwe) return res.status(400).json({ ok: false, code: "INVALID_SIWE_FORMAT" });
+  if (!ALLOWED_DOMAINS.has(siwe.domain)) return res.status(400).json({ ok: false, code: "DOMAIN_NOT_ALLOWED" });
   try {
     const u = new URL(siwe.uri);
     if (!ALLOWED_URI_PREFIXES.some((p) => u.href.startsWith(p))) {
-      return res.status(400).json({ ok:false, code:"URI_NOT_ALLOWED" });
+      return res.status(400).json({ ok: false, code: "URI_NOT_ALLOWED" });
     }
-  } catch { return res.status(400).json({ ok:false, code:"URI_NOT_ALLOWED" }); }
-  if (!ALLOWED_CHAINS.has(Number(siwe.chainId))) return res.status(400).json({ ok:false, code:"CHAIN_NOT_ALLOWED" });
-  if (!withinAge(siwe.issuedAt)) return res.status(400).json({ ok:false, code:"MESSAGE_TOO_OLD" });
-  if (String(siwe.nonce) !== providedNonce) return res.status(401).json({ ok:false, code:"NONCE_MISMATCH" });
+  } catch { return res.status(400).json({ ok: false, code: "URI_NOT_ALLOWED" }); }
+  if (!ALLOWED_CHAINS.has(Number(siwe.chainId))) return res.status(400).json({ ok: false, code: "CHAIN_NOT_ALLOWED" });
+  if (!withinAge(siwe.issuedAt)) return res.status(400).json({ ok: false, code: "MESSAGE_TOO_OLD" });
+  if (siwe.nonce !== cookieNonce) return res.status(401).json({ ok: false, code: "NONCE_MISMATCH" });
 
-  // Signatur (ethers)
+  // Signatur prüfen (Node runtime erforderlich)
   const ethersMod = await import("ethers");
   const verify =
     ethersMod.verifyMessage ||
     (ethersMod.default && ethersMod.default.verifyMessage) ||
     (ethersMod.utils && ethersMod.utils.verifyMessage);
-  if (typeof verify !== "function") return res.status(500).json({ ok:false, code:"VERIFY_UNAVAILABLE" });
+  if (typeof verify !== "function") return res.status(500).json({ ok: false, code: "VERIFY_UNAVAILABLE" });
 
   const recovered = await verify(message, signature);
-  if (!addrEq(recovered, siwe.address)) return res.status(401).json({ ok:false, code:"ADDRESS_MISMATCH" });
+  if (!addrEq(recovered, siwe.address)) return res.status(401).json({ ok: false, code: "ADDRESS_MISMATCH" });
 
   // Supabase Admin
   const SUPABASE_URL = process.env.SUPABASE_URL;
   const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-    return res.status(500).json({ ok:false, code:"SERVER_CONFIG_MISSING" });
+    return res.status(500).json({ ok: false, code: "SERVER_CONFIG_MISSING" });
   }
   const { createClient } = await import("@supabase/supabase-js");
   const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
 
   const addressLower = String(siwe.address).toLowerCase();
 
-  // 1) Wallet upsert (Adresse)
+  // 1) Wallet upsert (nur Adresse)
   {
     const { error: upErr } = await sb
       .from("wallets")
       .upsert({ address: addressLower }, { onConflict: "address" });
     if (upErr) {
       console.error("[register] upsert wallets failed:", upErr);
-      return res.status(500).json({ ok:false, code:"DB_UPSERT_ERROR" });
+      return res.status(500).json({ ok: false, code: "DB_UPSERT_ERROR" });
     }
   }
 
@@ -146,16 +154,22 @@ export default withCors(async function handler(req, res) {
     .maybeSingle();
   if (wErr) {
     console.error("[register] select wallets failed:", wErr);
-    return res.status(500).json({ ok:false, code:"DB_SELECT_ERROR" });
+    return res.status(500).json({ ok: false, code: "DB_SELECT_ERROR" });
   }
 
   let profileId = walletRow?.user_id ?? null;
 
-  // 3) LINK-Fall (E-Mail-User ist eingeloggt)
+  // 3) LINK-Fall: bestehende E-Mail Session per Bearer
+  let authUserId = null;
   let linkProfileId = null;
+
   if (intent === "link" && bearer) {
-    const { data: authData } = await sb.auth.getUser(bearer).catch(() => ({ data:null }));
-    const authUserId = authData?.user?.id || null;
+    try {
+      const { data: authData, error: authErr } = await sb.auth.getUser(bearer);
+      if (!authErr) authUserId = authData?.user?.id || null;
+    } catch (e) {
+      console.warn("[register] getUser via bearer exception:", e?.message || e);
+    }
 
     if (authUserId) {
       const { data: profExisting } = await sb
@@ -174,14 +188,19 @@ export default withCors(async function handler(req, res) {
           .single();
         if (pInsErr) {
           console.error("[register] create profiles(user_id=auth) failed:", pInsErr);
-          return res.status(500).json({ ok:false, code:"PROFILE_CREATE_ERROR" });
+          return res.status(500).json({ ok: false, code: "PROFILE_CREATE_ERROR" });
         }
         linkProfileId = profNew.id;
       }
 
       if (walletRow?.user_id && walletRow.user_id !== linkProfileId) {
-        return res.status(409).json({ ok:false, code:"WALLET_ALREADY_LINKED" });
+        return res.status(409).json({
+          ok: false,
+          code: "WALLET_ALREADY_LINKED",
+          message: "This wallet is already linked to another profile.",
+        });
       }
+
       if (!walletRow?.user_id) {
         const { error: linkErr } = await sb
           .from("wallets")
@@ -189,7 +208,7 @@ export default withCors(async function handler(req, res) {
           .eq("address", addressLower);
         if (linkErr) {
           console.error("[register] link wallet->profile failed:", linkErr);
-          return res.status(500).json({ ok:false, code:"LINK_ERROR" });
+          return res.status(500).json({ ok: false, code: "LINK_ERROR" });
         }
         profileId = linkProfileId;
         walletRow = { ...walletRow, user_id: linkProfileId };
@@ -199,16 +218,17 @@ export default withCors(async function handler(req, res) {
     }
   }
 
-  // 4) „echter“ Sign-up ohne Bearer: Profil erzeugen & Wallet verlinken
+  // 4) Standard: neues Profil anlegen & verlinken
   if (!profileId && !linkProfileId) {
+    const insertPayload = creatorName ? { creator_name: creatorName } : {};
     const { data: prof, error: pErr } = await sb
       .from("profiles")
-      .insert(creatorName ? { creator_name: creatorName } : {})
+      .insert(insertPayload)
       .select("id")
       .single();
     if (pErr) {
       console.error("[register] create profile failed:", pErr);
-      return res.status(500).json({ ok:false, code:"PROFILE_UPSERT_ERROR" });
+      return res.status(500).json({ ok: false, code: "PROFILE_UPSERT_ERROR" });
     }
     profileId = prof.id;
 
@@ -218,13 +238,12 @@ export default withCors(async function handler(req, res) {
       .eq("address", addressLower);
     if (linkErr) {
       console.error("[register] link wallet->profile failed:", linkErr);
-      return res.status(500).json({ ok:false, code:"LINK_ERROR" });
+      return res.status(500).json({ ok: false, code: "LINK_ERROR" });
     }
   } else if (creatorName && profileId) {
     await sb.from("profiles").update({ creator_name: creatorName }).eq("id", profileId);
   }
 
-  // Nonce absichtlich NICHT löschen (damit Verify mit derselben Signatur klappt)
   res.setHeader("Cache-Control", "no-store");
   return res.status(200).json({
     ok: true,
@@ -234,6 +253,8 @@ export default withCors(async function handler(req, res) {
     keepNonce: true,
     linked: Boolean(linkProfileId),
   });
-});
+}
 
+export default withCors(handler);
+// Node-Runtime erzwingen (ethers)
 export const config = { runtime: "nodejs" };
