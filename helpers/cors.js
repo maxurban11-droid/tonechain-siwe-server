@@ -69,12 +69,22 @@ function matchOrigin(origin) {
 }
 
 /** Setzt CORS-Header auf Node/Express/Next (Pages-Router) Response */
-function setCorsHeaders(res, allowedOrigin) {
+function setCorsHeaders(res, allowedOrigin, req) {
   res.setHeader("Vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Headers");
   res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
   res.setHeader("Access-Control-Allow-Credentials", "true");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Max-Age", "600");
+
+  // reflect preflight-requested headers, fallback incl. X-TC-Intent
+  const requested = (req?.headers?.["access-control-request-headers"] ||
+                     req?.headers?.["Access-Control-Request-Headers"] ||
+                     "").toString().trim();
+
+  const fallback = "Content-Type, Authorization, X-TC-Intent";
+  res.setHeader("Access-Control-Allow-Headers", requested || fallback);
+
   res.setHeader("Access-Control-Max-Age", "600");
 }
 
@@ -101,16 +111,20 @@ export function withCors(handler) {
     const origin = req.headers.origin || "";
     const allowed = matchOrigin(origin);
 
-    // Preflight: wenn Origin NICHT erlaubt ist, antworte neutral ohne Freigabe
+    // OPTIONS → always answer (even if not allowed), but only grant when allowed
     if (req.method === "OPTIONS") {
-      if (allowed) setCorsHeaders(res, allowed);
+      if (allowed) setCorsHeaders(res, allowed, req);
+      else {
+        // neutral preflight answer without grant
+        res.setHeader("Vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Headers");
+      }
       return res.status(204).end();
     }
 
-    // HEAD behandeln wie GET, aber ohne Body
+    // HEAD behave like GET without body
     if (req.method === "HEAD") {
       if (!allowed) return res.status(403).end();
-      setCorsHeaders(res, allowed);
+      setCorsHeaders(res, allowed, req);
       return res.status(204).end();
     }
 
@@ -118,7 +132,7 @@ export function withCors(handler) {
       return res.status(403).json({ ok: false, error: "Origin not allowed" });
     }
 
-    setCorsHeaders(res, allowed);
+    setCorsHeaders(res, allowed, req);
     return handler(req, res);
   };
 }
