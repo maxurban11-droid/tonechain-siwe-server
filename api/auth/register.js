@@ -6,6 +6,8 @@
 // - Nonce wird NICHT gelöscht, damit /verify mit derselben Signatur sofort klappt.
 
 import { withCors } from "../../helpers/cors.js";
+import { readNonceFromReq } from "../../helpers/nonce.js";
+import { SiweMessage } from "siwe"; // falls du SIWE parse nutzt
 
 const ALLOWED_DOMAINS = new Set(["tonechain.app", "concave-device-193297.framer.app"]);
 const ALLOWED_URI_PREFIXES = [
@@ -16,6 +18,15 @@ const ALLOWED_CHAINS = new Set([1, 11155111]);
 const MAX_AGE_MIN = 10;
 const MAX_SKEW_MS = 5 * 60 * 1000;
 const COOKIE_NONCE = "tc_nonce";
+
+const provided = readNonceFromReq(req);        // Header oder Cookie
+const { message, signature } = req.body || {};
+const msg = new SiweMessage(message);
+const fields = await msg.verify({ signature, /* ... */ });
+// Prüfen, dass Nonce in der Message = bereitgestellte Nonce:
+if (!provided || String(fields.data.nonce) !== String(provided)) {
+  return res.status(400).json({ ok:false, code:"NONCE_MISMATCH" });
+}
 
 /* ---------- Helpers ---------- */
 function getCookie(req, name) {
