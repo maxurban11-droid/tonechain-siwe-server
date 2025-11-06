@@ -1,64 +1,49 @@
-// /api/auth/nonce.js — stabile Nonce-Route für SIWE (Node runtime)
+// api/auth/nonce.js
+// Gibt eine frische Nonce aus und setzt sie als HttpOnly-Cookie (tc_nonce).
+// Akzeptiert GET/POST, CORS identisch zu register/verify.
+
+import { withCors } from "../../helpers/cors.js";
 import crypto from "node:crypto";
 
-const ALLOWED_DOMAINS = new Set([
-  "tonechain.app",
-  "concave-device-193297.framer.app",
-]);
 const COOKIE_NONCE = "tc_nonce";
-const MAX_AGE_SEC = 600; // 10 Minuten
+const NONCE_TTL_SEC = 10 * 60; // 10 Minuten
 
-function originAllowed(req) {
-  const origin = req.headers.origin || "";
-  try {
-    if (!origin) return false;
-    const u = new URL(origin);
-    return ALLOWED_DOMAINS.has(u.hostname);
-  } catch { return false; }
+function randomNonce() {
+  // URL-sicher, kurz & ausreichend entropisch
+  return crypto.randomBytes(16).toString("base64url");
 }
 
 function setCookie(res, name, value, opts = {}) {
-  const parts = [`${name}=${value}`];
-  parts.push("Path=/");
+  const parts = [
+    `${name}=${value}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=None",
+    "Secure",
+    "Partitioned", // wichtig bei Third-Party-Cookies (Framer → Vercel)
+  ];
   if (opts.maxAgeSec != null) parts.push(`Max-Age=${opts.maxAgeSec}`);
-  parts.push("HttpOnly");
-  parts.push("SameSite=None");
-  parts.push("Secure");
-  parts.push("Partitioned"); // <<< WICHTIG für 3rd-party / CHIPS
+
   const prev = res.getHeader("Set-Cookie");
-  res.setHeader("Set-Cookie", [...(prev ? [].concat(prev) : []), parts.join("; ")]);
+  res.setHeader(
+    "Set-Cookie",
+    [...(Array.isArray(prev) ? prev : prev ? [String(prev)] : []), parts.join("; ")]
+  );
 }
-export default async function handler(req, res) {
-  const origin = req.headers.origin || "";
-  // Debug-Header: im Network-Tab leicht sichtbar
-  res.setHeader("X-TC-Origin", origin || "EMPTY");
 
-  // CORS – nur Whitelist spiegeln (nie "*", da credentials:true)
-  if (origin && originAllowed(req)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Access-Control-Allow-Credentials", "true");
-  }
-  res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method !== "POST") return res.status(405).json({ ok: false, code: "METHOD_NOT_ALLOWED" });
-
-  // Nonce generieren
-  let nonce;
-  try {
-    nonce =
-      (globalThis.crypto?.randomUUID?.() ?? null) ||
-      crypto.randomBytes(16).toString("hex");
-  } catch {
-    nonce = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+async function handler(req, res) {
+  // withCors beantwortet OPTIONS bereits korrekt
+  if (req.method !== "GET" && req.method !== "POST") {
+    return res.status(405).json({ ok: false, code: "METHOD_NOT_ALLOWED" });
   }
 
-  // Cookie setzen
-  setCookie(res, COOKIE_NONCE, nonce, { maxAgeSec: MAX_AGE_SEC });
+  const nonce = randomNonce();
+  setCookie(res, COOKIE_NONCE, nonce, { maxAgeSec: NONCE_TTL_SEC });
   res.setHeader("Cache-Control", "no-store");
-  return res.status(200).json({ ok: true, nonce });
+
+  // Body enthält Nonce für die SIWE-Message
+  return res.status(200).json({ ok: true, nonce, ttlSec: NONCE_TTL_SEC });
 }
 
-// **WICHTIG**: Node-Runtime erzwingen
+export default withCors(handler);
 export const config = { runtime: "nodejs" };
