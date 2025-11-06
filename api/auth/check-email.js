@@ -35,16 +35,16 @@ async function findByAdminRest(base, serviceRole, email) {
   return users.find(u => String(u.email || "").toLowerCase() === email.toLowerCase()) || null;
 }
 
-async function findByAdminList(supabaseAdmin, email) {
-  // Fallback: bis zu 5 Seiten à 200 User (max ~1000)
+async function findByAdminList(admin, email) {
+  // Fallback: bis zu 5 Seiten à 200 User (max. ~1000)
   const perPage = 200;
   for (let page = 1; page <= 5; page++) {
-    const { data, error } = await supabaseAdmin.auth.admin.listUsers({ page, perPage });
+    const { data, error } = await admin.auth.admin.listUsers({ page, perPage });
     if (error) throw error;
     const users = data?.users || [];
     const hit = users.find(u => String(u.email || "").toLowerCase() === email.toLowerCase());
     if (hit) return hit;
-    if (users.length < perPage) break; // keine weiteren Seiten
+    if (users.length < perPage) break;
   }
   return null;
 }
@@ -59,27 +59,25 @@ export default withCors(async function handler(req, res) {
     if (!email) return res.status(400).json({ ok:false, code:"bad_input" });
 
     const base = getSupabaseUrl();
-    const serviceRole = getServiceRole();
-    if (!serviceRole) throw new Error("Missing SUPABASE_SERVICE_ROLE(_KEY)");
+    const role = getServiceRole();
+    if (!role) throw new Error("Missing SUPABASE_SERVICE_ROLE(_KEY)");
 
     if (process.env.DEBUG_CHECK_EMAIL === "1") {
       console.log("[check-email] project:", new URL(base).host);
+      console.log("[check-email] query:", email);
     }
 
-    // 1) Primär: Admin REST filter
+    // 1) Primär: Admin REST mit Email-Filter
     let user = null;
     try {
-      user = await findByAdminRest(base, serviceRole, email);
+      user = await findByAdminRest(base, role, email);
     } catch (e) {
-      // Loggen & Fallback benutzen
-      console.warn("[check-email] admin REST failed, trying listUsers fallback:", e?.message);
+      console.warn("[check-email] admin REST failed → fallback listUsers:", e?.message);
     }
 
-    // 2) Fallback: listUsers() paginiert
+    // 2) Fallback: paginierte listUsers()
     if (!user) {
-      const admin = createClient(base, serviceRole, {
-        auth: { persistSession: false, autoRefreshToken: false },
-      });
+      const admin = createClient(base, role, { auth: { persistSession: false, autoRefreshToken: false } });
       user = await findByAdminList(admin, email);
     }
 
@@ -87,7 +85,7 @@ export default withCors(async function handler(req, res) {
     const confirmed = !!user?.email_confirmed_at;
 
     if (process.env.DEBUG_CHECK_EMAIL === "1") {
-      console.log("[check-email] result:", { exists, confirmed, email });
+      console.log("[check-email] result:", { exists, confirmed });
     }
 
     return res.status(200).json({ exists, confirmed });
