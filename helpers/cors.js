@@ -11,7 +11,11 @@ const DEFAULT_ORIGINS = [
 ];
 
 /** ENV-Whitelist: CORS_ORIGINS=foo.com,https://bar.app,https://*.example.com */
-const envList = (process.env.CORS_ORIGINS || process.env.ALLOWED_ORIGINS || "")
+const envList = (
+  process.env.CORS_ORIGINS ||
+  process.env.CORS_ORIGIN ||    // <- neu: Singular akzeptieren
+  process.env.ALLOWED_ORIGINS ||
+  "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
