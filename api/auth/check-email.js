@@ -1,88 +1,69 @@
-// app/api/auth/check-email/route.js
-export const runtime = "nodejs"; // wichtig: Service-Role sicher nutzen
+// /api/auth/check-email.js  (Pages Router)
+import { withCors } from "../helpers/cors.js"; // <- Pfad von /api/auth → /helpers
+// Wenn dein helpers-Ordner direkt unter Root liegt, ist der Pfad "../helpers/cors.js" korrekt.
+// Liegt er unter /api/helpers, nimm "./../helpers/cors.js".
 
-import { createClient } from "@supabase/supabase-js";
-// Achtung: relative Endung .js ist bei ESM wichtig
-import { corsHeadersForOrigin } from "../../helpers/cors.js";
+const SUPABASE_URL =
+  process.env.NEXT_PUBLIC_SUPABASE_URL ||
+  process.env.SUPABASE_URL ||
+  "";
 
-function getCors(origin) {
-  return corsHeadersForOrigin(origin) || {}; // ggf. leeres Objekt
-}
+const SERVICE_ROLE =
+  process.env.SUPABASE_SERVICE_ROLE ||
+  process.env.SUPABASE_SERVICE_ROLE_KEY || // <- wichtig: _KEY fallback
+  "";
 
-function getAdminClient() {
-  const url =
-    process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL || "";
-  const serviceRole = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
-  if (!url || !serviceRole) {
-    throw new Error("Missing SUPABASE env (URL or SERVICE_ROLE).");
+async function handler(req, res) {
+  // Preflight & HEAD werden von withCors schon korrekt beantwortet.
+  if (req.method !== "POST") {
+    return res.status(405).json({ ok: false, code: "method_not_allowed" });
   }
-  return createClient(url, serviceRole, {
-    auth: { persistSession: false, autoRefreshToken: false },
+
+  if (!SUPABASE_URL || !SERVICE_ROLE) {
+    return res.status(500).json({
+      ok: false,
+      code: "server_error",
+      message: "Missing SUPABASE env (URL or SERVICE_ROLE_KEY).",
+    });
+  }
+
+  const email = (req.body && (req.body.email ?? req.body?.data?.email)) || "";
+  if (!email || typeof email !== "string") {
+    return res.status(400).json({ ok: false, code: "bad_input" });
+  }
+
+  const adminEndpoint =
+    SUPABASE_URL.replace(/\/+$/, "") +
+    "/auth/v1/admin/users?email=" +
+    encodeURIComponent(email);
+
+  const r = await fetch(adminEndpoint, {
+    headers: {
+      apikey: SERVICE_ROLE,
+      Authorization: `Bearer ${SERVICE_ROLE}`,
+      "content-type": "application/json",
+    },
   });
-}
 
-export async function OPTIONS(req) {
-  const origin = req.headers.get("origin") || "";
-  // Preflight IMMER beantworten (mit oder ohne Match – Browser blockt sonst)
-  return new Response(null, { status: 204, headers: getCors(origin) });
-}
-
-export async function POST(req) {
-  const origin = req.headers.get("origin") || "";
-  const cors = getCors(origin);
-
-  try {
-    const { email } = await req.json().catch(() => ({}));
-    if (!email || typeof email !== "string") {
-      return new Response(
-        JSON.stringify({ ok: false, code: "bad_input" }),
-        { status: 400, headers: { "content-type": "application/json", ...cors } }
-      );
-    }
-
-    const admin = getAdminClient();
-
-    // Zuverlässige Abfrage: Auth Admin REST (E-Mail-Filter)
-    const url =
-      (process.env.NEXT_PUBLIC_SUPABASE_URL || "").replace(/\/+$/, "") +
-      `/auth/v1/admin/users?email=${encodeURIComponent(email)}`;
-
-    const serviceRole = process.env.SUPABASE_SERVICE_ROLE;
-    const r = await fetch(url, {
-      headers: {
-        apikey: serviceRole,
-        Authorization: `Bearer ${serviceRole}`,
-        "content-type": "application/json",
-      },
+  if (!r.ok) {
+    const txt = await r.text().catch(() => "");
+    return res.status(500).json({
+      ok: false,
+      code: "supabase_admin_failed",
+      message: `admin users lookup failed (${r.status}): ${txt}`,
     });
-
-    if (!r.ok) {
-      const txt = await r.text().catch(() => "");
-      throw new Error(`admin users lookup failed (${r.status}): ${txt}`);
-    }
-
-    const j = await r.json().catch(() => ({}));
-    // Antwortform: { users: [...] } oder Array – je nach Version → beides abfangen
-    const users = Array.isArray(j) ? j : j.users || [];
-    const user = users.find(
-      (u) => String(u.email || "").toLowerCase() === email.toLowerCase()
-    );
-
-    const exists = !!user;
-    const confirmed = !!user?.email_confirmed_at;
-
-    return new Response(JSON.stringify({ exists, confirmed }), {
-      status: 200,
-      headers: { "content-type": "application/json", ...cors },
-    });
-  } catch (e) {
-    return new Response(
-      JSON.stringify({
-        ok: false,
-        code: "server_error",
-        message: e?.message || "Server error",
-      }),
-      { status: 500, headers: { "content-type": "application/json", ...cors } }
-    );
   }
+
+  const j = await r.json().catch(() => ({}));
+  const users = Array.isArray(j) ? j : j.users || [];
+  const user = users.find(
+    (u) => String(u.email || "").toLowerCase() === email.toLowerCase()
+  );
+
+  const exists = !!user;
+  const confirmed = !!user?.email_confirmed_at;
+
+  return res.status(200).json({ exists, confirmed });
 }
+
+export default withCors(handler);
