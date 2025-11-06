@@ -3,7 +3,7 @@ export const runtime = "nodejs"; // wichtig: Service-Role sicher nutzen
 
 import { createClient } from "@supabase/supabase-js";
 // Achtung: relative Endung .js ist bei ESM wichtig
-import { corsHeadersForOrigin } from "../../../helpers/cors.js";
+import { corsHeadersForOrigin } from "../../helpers/cors.js";
 
 function getCors(origin) {
   return corsHeadersForOrigin(origin) || {}; // ggf. leeres Objekt
