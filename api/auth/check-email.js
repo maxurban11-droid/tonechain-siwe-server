@@ -1,67 +1,88 @@
-// pages/api/auth/check-email.js
-import { withCors } from "../../helpers/cors.js";
+// app/api/auth/check-email/route.js
+export const runtime = "nodejs"; // wichtig: Service-Role sicher nutzen
+
 import { createClient } from "@supabase/supabase-js";
+// Achtung: relative Endung .js ist bei ESM wichtig
+import { corsHeadersForOrigin } from "../../../../helpers/cors.js";
 
-const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const service = process.env.SUPABASE_SERVICE_ROLE;
-
-// Admin-Client: nur im Servercode (Service-Role)!
-const supabaseAdmin = createClient(url, service, {
-  auth: { autoRefreshToken: false, persistSession: false },
-});
-
-function normalizeEmail(v) {
-  return String(v || "").trim().toLowerCase();
+function getCors(origin) {
+  return corsHeadersForOrigin(origin) || {}; // ggf. leeres Objekt
 }
 
-async function handler(req, res) {
-  if (req.method !== "POST") {
-    return res.status(405).json({ ok: false, error: "method_not_allowed" });
+function getAdminClient() {
+  const url =
+    process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL || "";
+  const serviceRole = process.env.SUPABASE_SERVICE_ROLE || "";
+  if (!url || !serviceRole) {
+    throw new Error("Missing SUPABASE env (URL or SERVICE_ROLE).");
   }
+  return createClient(url, serviceRole, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+}
+
+export async function OPTIONS(req) {
+  const origin = req.headers.get("origin") || "";
+  // Preflight IMMER beantworten (mit oder ohne Match – Browser blockt sonst)
+  return new Response(null, { status: 204, headers: getCors(origin) });
+}
+
+export async function POST(req) {
+  const origin = req.headers.get("origin") || "";
+  const cors = getCors(origin);
 
   try {
-    const { email } = (req.body || {});
-    const mail = normalizeEmail(email);
-    if (!mail) return res.status(400).json({ ok: false, error: "bad_input" });
-
-    // 1) Auth-User prüfen
-    let user = null;
-    try {
-      const { data, error } = await supabaseAdmin.auth.admin.getUserByEmail(mail);
-      if (error) {
-        // z.B. wenn Mail nicht existiert
-        user = null;
-      } else {
-        user = data?.user ?? null;
-      }
-    } catch (e) {
-      // Fallback: treat as not found (keine harten Fehler nach außen)
-      user = null;
+    const { email } = await req.json().catch(() => ({}));
+    if (!email || typeof email !== "string") {
+      return new Response(
+        JSON.stringify({ ok: false, code: "bad_input" }),
+        { status: 400, headers: { "content-type": "application/json", ...cors } }
+      );
     }
 
-    // 2) Profile prüfen (existiert evtl. schon ohne bestätigte Mail)
-    let profile = null;
-    try {
-      const { data: prof } = await supabaseAdmin
-        .from("profiles")
-        .select("id,user_id,email")
-        .or(`email.eq.${mail},user_id.eq.${user?.id ?? "00000000-0000-0000-0000-000000000000"}`)
-        .maybeSingle();
-      profile = prof ?? null;
-    } catch {
-      profile = null;
+    const admin = getAdminClient();
+
+    // Zuverlässige Abfrage: Auth Admin REST (E-Mail-Filter)
+    const url =
+      (process.env.NEXT_PUBLIC_SUPABASE_URL || "").replace(/\/+$/, "") +
+      `/auth/v1/admin/users?email=${encodeURIComponent(email)}`;
+
+    const serviceRole = process.env.SUPABASE_SERVICE_ROLE;
+    const r = await fetch(url, {
+      headers: {
+        apikey: serviceRole,
+        Authorization: `Bearer ${serviceRole}`,
+        "content-type": "application/json",
+      },
+    });
+
+    if (!r.ok) {
+      const txt = await r.text().catch(() => "");
+      throw new Error(`admin users lookup failed (${r.status}): ${txt}`);
     }
 
-    const exists = !!(user || profile);
-    const confirmed =
-      !!(user && (user.email_confirmed_at || user.confirmed_at)); // supabase user model
+    const j = await r.json().catch(() => ({}));
+    // Antwortform: { users: [...] } oder Array – je nach Version → beides abfangen
+    const users = Array.isArray(j) ? j : j.users || [];
+    const user = users.find(
+      (u) => String(u.email || "").toLowerCase() === email.toLowerCase()
+    );
 
-    return res.status(200).json({ exists, confirmed });
+    const exists = !!user;
+    const confirmed = !!user?.email_confirmed_at;
+
+    return new Response(JSON.stringify({ exists, confirmed }), {
+      status: 200,
+      headers: { "content-type": "application/json", ...cors },
+    });
   } catch (e) {
-    console.error("[check-email] error:", e);
-    // Kein Leak, aber stabile Antwort
-    return res.status(200).json({ exists: false, confirmed: false });
+    return new Response(
+      JSON.stringify({
+        ok: false,
+        code: "server_error",
+        message: e?.message || "Server error",
+      }),
+      { status: 500, headers: { "content-type": "application/json", ...cors } }
+    );
   }
 }
-
-export default withCors(handler);
