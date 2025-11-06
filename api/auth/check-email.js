@@ -12,7 +12,7 @@ function getCors(origin) {
 function getAdminClient() {
   const url =
     process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL || "";
-  const serviceRole = process.env.SUPABASE_SERVICE_ROLE || "";
+  const serviceRole = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
   if (!url || !serviceRole) {
     throw new Error("Missing SUPABASE env (URL or SERVICE_ROLE).");
   }
