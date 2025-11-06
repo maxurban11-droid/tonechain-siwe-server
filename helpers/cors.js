@@ -74,7 +74,10 @@ function setCorsHeaders(res, allowedOrigin, req) {
   res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
   res.setHeader("Access-Control-Allow-Credentials", "true");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader(
+   "Access-Control-Allow-Headers",
+   "Content-Type, Authorization, X-TC-Intent, X-TC-Nonce"
+ );
   res.setHeader("Access-Control-Max-Age", "600");
 
   // reflect preflight-requested headers, fallback incl. X-TC-Intent
@@ -97,7 +100,7 @@ export function corsHeadersForOrigin(origin) {
     "Access-Control-Allow-Origin": allowed,
     "Access-Control-Allow-Credentials": "true",
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-TC-Intent, X-TC-Nonce",
     "Access-Control-Max-Age": "600",
   };
 }
