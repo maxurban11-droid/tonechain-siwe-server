@@ -1,136 +1,95 @@
-// /api/auth/peek.js — robuste SIWE-Session-Inspektion (Node runtime)
+// api/auth/peek.js
+// Liest die SIWE-Session (tc_session) aus, prüft Signatur & Ablauf
+// und gibt den aktuellen Auth-Status zurück.
+
 import { withCors } from "../../helpers/cors.js";
 import crypto from "node:crypto";
 
-/* ==============================
-   Konfiguration
-============================== */
 const COOKIE_SESSION = "tc_session";
-// Optional: serverseitige Signaturprüfung
 const SESSION_SECRET = process.env.SESSION_SECRET || null;
 
-/* ==============================
-   Helpers
-============================== */
-function sign(val) {
-  if (!SESSION_SECRET) return null;
-  return crypto.createHmac("sha256", SESSION_SECRET).update(val).digest("hex");
-}
+function setDebug(res, msg) { try { res.setHeader("X-TC-Debug", msg); } catch {} }
 
-function readCookie(req, name) {
+function getCookie(req, name) {
   const raw = req.headers.cookie || "";
-  for (const part of raw.split(/;\s*/)) {
-    const [k, ...rest] = part.split("=");
-    if (k === name) return decodeURIComponent(rest.join("=") || "");
-  }
-  return null;
-}
-
-function pushCookie(res, cookie) {
-  const prev = res.getHeader("Set-Cookie");
-  if (!prev) res.setHeader("Set-Cookie", [cookie]);
-  else if (Array.isArray(prev)) res.setHeader("Set-Cookie", [...prev, cookie]);
-  else res.setHeader("Set-Cookie", [String(prev), cookie]);
+  const hit = raw.split(/;\s*/).find((s) => s.startsWith(name + "="));
+  return hit ? decodeURIComponent(hit.split("=").slice(1).join("=")) : null;
 }
 
 function clearCookie(res, name) {
-  // Cross-site kompatibel löschen
-  pushCookie(res, `${name}=; Path=/; Max-Age=0; HttpOnly; SameSite=None; Secure`);
+  const del = `${name}=; Path=/; Max-Age=0; HttpOnly; SameSite=None; Secure; Partitioned`;
+  const prev = res.getHeader("Set-Cookie");
+  res.setHeader("Set-Cookie", [...(Array.isArray(prev) ? prev : prev ? [String(prev)] : []), del]);
 }
 
-/**
- * tc_session-Format (Base64):
- *   { raw, sig? }  // JSON-stringifiziert, dann Base64
- *   raw = JSON.stringify({ v:1, addr:string, ts:number, exp:number, userId?:string })
- *   sig = HMAC-SHA256(raw, SESSION_SECRET)   // optional
- */
-function decodeSessionCookie(sessionCookie) {
-  if (!sessionCookie) return null;
-  let envelope;
-  try {
-    const json = Buffer.from(sessionCookie, "base64").toString("utf8");
-    envelope = JSON.parse(json);
-  } catch {
-    return null;
-  }
-  if (!envelope || typeof envelope !== "object") return null;
+function hmac(payload) {
+  if (!SESSION_SECRET) return null;
+  return crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("hex");
+}
 
-  const { raw, sig } = envelope;
-  if (typeof raw !== "string") return null;
+function safeJsonParse(str) {
+  try { return JSON.parse(str); } catch { return null; }
+}
 
-  if (SESSION_SECRET) {
-    const expect = sign(raw);
-    if (!sig || sig !== expect) return { invalid: true };
-  }
+async function handler(req, res) {
+  // Preflight wird im withCors erledigt; GET/HEAD erlauben
+  if (req.method === "HEAD") return res.status(204).end();
+  if (req.method !== "GET") return res.status(405).json({ ok:false, code:"METHOD_NOT_ALLOWED" });
 
   try {
-    const payload = JSON.parse(raw);
-    if (
-      !payload ||
-      typeof payload !== "object" ||
-      payload.v !== 1 ||
-      !payload.addr ||
-      !Number.isFinite(payload.ts) ||
-      !Number.isFinite(payload.exp)
-    ) {
-      return null;
+    const rawCookie = getCookie(req, COOKIE_SESSION);
+    if (!rawCookie) {
+      setDebug(res, "no-session-cookie");
+      return res.status(200).json({ ok:true, authenticated:false });
     }
-    return { payload };
-  } catch {
-    return null;
+
+    // tc_session ist base64(JSON({ raw, sig? }))
+    const decoded = Buffer.from(String(rawCookie), "base64").toString("utf8");
+    const wrapped = safeJsonParse(decoded);
+    if (!wrapped || !wrapped.raw) {
+      clearCookie(res, COOKIE_SESSION);
+      return res.status(200).json({ ok:true, authenticated:false });
+    }
+
+    // Signatur prüfen (wenn SECRET konfiguriert)
+    if (SESSION_SECRET) {
+      const expected = hmac(wrapped.raw);
+      if (!wrapped.sig || wrapped.sig !== expected) {
+        setDebug(res, "bad-sig");
+        clearCookie(res, COOKIE_SESSION);
+        return res.status(200).json({ ok:true, authenticated:false });
+      }
+    }
+
+    const payload = safeJsonParse(wrapped.raw);
+    if (!payload || typeof payload !== "object") {
+      clearCookie(res, COOKIE_SESSION);
+      return res.status(200).json({ ok:true, authenticated:false });
+    }
+
+    // Ablauf prüfen
+    if (!payload.exp || Date.now() > Number(payload.exp)) {
+      setDebug(res, "expired");
+      clearCookie(res, COOKIE_SESSION);
+      return res.status(200).json({ ok:true, authenticated:false, expired:true });
+    }
+
+    // Minimaldaten für UI
+    const result = {
+      ok: true,
+      authenticated: true,
+      address: payload.addr || null,
+      userId: payload.userId || null,
+      // optional: expiresInMs für UI
+      expiresInMs: Number(payload.exp) - Date.now(),
+    };
+
+    return res.status(200).json(result);
+  } catch (e) {
+    console.error("[peek] unexpected error:", e);
+    return res.status(500).json({ ok:false, code:"INTERNAL_ERROR" });
   }
 }
 
-/* ==============================
-   Core-Handler (CORS via withCors)
-============================== */
-async function core(req, res) {
-  if (req.method !== "GET") {
-    return res.status(405).json({ ok: false, code: "METHOD_NOT_ALLOWED" });
-  }
-
-  const sessionCookie = readCookie(req, COOKIE_SESSION);
-  if (!sessionCookie) {
-    return res.status(200).json({
-      ok: true,
-      hasSession: false,
-      sessionAddress: null,
-    });
-  }
-
-  const decoded = decodeSessionCookie(sessionCookie);
-  if (!decoded || decoded.invalid) {
-    clearCookie(res, COOKIE_SESSION);
-    return res.status(200).json({
-      ok: true,
-      hasSession: false,
-      sessionAddress: null,
-    });
-  }
-
-  const { payload } = decoded; // { v, addr, ts, exp, userId? }
-  const now = Date.now();
-  if (payload.exp <= now) {
-    clearCookie(res, COOKIE_SESSION);
-    return res.status(200).json({
-      ok: true,
-      hasSession: false,
-      sessionAddress: null,
-      expired: true,
-    });
-  }
-
-  return res.status(200).json({
-    ok: true,
-    hasSession: true,
-    sessionAddress: payload.addr,
-    // optional:
-    // userId: payload.userId ?? null,
-    // issuedAt: payload.ts,
-    // expiresAt: payload.exp,
-  });
-}
-
-export default withCors(core);
-// Nicht als Edge laufen lassen
+export default withCors(handler);
 export const config = { runtime: "nodejs" };
