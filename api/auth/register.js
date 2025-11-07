@@ -1,15 +1,18 @@
 // api/auth/register.js
-// SIWE "register/link" – robustes CORS, keine Top-Level-req/res,
-// Node runtime (ethers), Nonce wird NICHT gelöscht.
+// SIWE "register/link" – robustes CORS, Node runtime (ethers), Nonce wird NICHT gelöscht.
 
 import { withCors } from "../../helpers/cors.js";
 
-const ALLOWED_DOMAINS = new Set(["tonechain.app", "concave-device-193297.framer.app"]);
+/* ---------- Policy ---------- */
+const ALLOWED_DOMAINS = new Set([
+  "tonechain.app",
+  "concave-device-193297.framer.app",
+]);
 const ALLOWED_URI_PREFIXES = [
   "https://tonechain.app",
   "https://concave-device-193297.framer.app",
 ];
-const ALLOWED_CHAINS = new Set([1, 11155111]);
+const ALLOWED_CHAINS = new Set([1, 11155111]); // mainnet + sepolia
 const MAX_AGE_MIN = 10;
 const MAX_SKEW_MS = 5 * 60 * 1000;
 const COOKIE_NONCE = "tc_nonce";
@@ -20,18 +23,15 @@ function getCookie(req, name) {
   const hit = raw.split(/;\s*/).find((s) => s.startsWith(name + "="));
   return hit ? decodeURIComponent(hit.split("=").slice(1).join("=")) : null;
 }
-
 function withinAge(iso) {
   const t = Date.parse(iso);
   if (!Number.isFinite(t)) return false;
   const age = Math.abs(Date.now() - t);
   return age <= MAX_AGE_MIN * 60 * 1000 + MAX_SKEW_MS;
 }
-
 function addrEq(a, b) {
   return String(a || "").toLowerCase() === String(b || "").toLowerCase();
 }
-
 function parseSiweMessage(msg) {
   const lines = String(msg || "").split("\n");
   if (lines.length < 2) return null;
@@ -65,7 +65,6 @@ function parseSiweMessage(msg) {
   }
   return out;
 }
-
 function readBearer(req) {
   const h = req.headers.authorization || req.headers.Authorization;
   if (!h) return null;
@@ -79,7 +78,7 @@ async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ ok: false, code: "METHOD_NOT_ALLOWED" });
 
   // Intent + Bearer
-  const intent = String(req.headers["x-tc-intent"] || req.headers["X-TC-Intent"] || "").toLowerCase(); // "link"/"signup"
+  const intent = String(req.headers["x-tc-intent"] || req.headers["X-TC-Intent"] || "").toLowerCase(); // "signup" | "link"
   const bearer = readBearer(req);
 
   // Body tolerant parsen
@@ -133,20 +132,20 @@ async function handler(req, res) {
   const { createClient } = await import("@supabase/supabase-js");
   const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
 
-  const addressLower = String(siwe.address).toLowerCase();
+  const addressLower = String(siwe.address || "").toLowerCase();
 
-  // 1) Wallet upsert (nur Adresse)
+  /* ---- 1) Wallet-Row sicherstellen (unique by address) ---- */
   {
     const { error: upErr } = await sb
       .from("wallets")
-      .upsert({ address: addressLower }, { onConflict: "address" });
+      .upsert({ address: addressLower }, { onConflict: "address", ignoreDuplicates: false });
     if (upErr) {
       console.error("[register] upsert wallets failed:", upErr);
       return res.status(500).json({ ok: false, code: "DB_UPSERT_ERROR" });
     }
   }
 
-  // 2) Wallet lesen
+  // Aktuellen Wallet-Status lesen
   let { data: walletRow, error: wErr } = await sb
     .from("wallets")
     .select("address,user_id")
@@ -159,7 +158,7 @@ async function handler(req, res) {
 
   let profileId = walletRow?.user_id ?? null;
 
-  // 3) LINK-Fall: bestehende E-Mail Session per Bearer
+  /* ---- 2) LINK: bestehende E-Mail-Session per Bearer verknüpfen ---- */
   let authUserId = null;
   let linkProfileId = null;
 
@@ -171,7 +170,12 @@ async function handler(req, res) {
       console.warn("[register] getUser via bearer exception:", e?.message || e);
     }
 
-    if (authUserId) {
+    if (!authUserId) {
+      return res.status(403).json({ ok: false, code: "LINK_REQUIRES_VALID_BEARER" });
+    }
+
+    // Profil der E-Mail-Session holen/erstellen
+    if (!linkProfileId) {
       const { data: profExisting } = await sb
         .from("profiles")
         .select("id")
@@ -192,34 +196,66 @@ async function handler(req, res) {
         }
         linkProfileId = profNew.id;
       }
+    }
 
-      if (walletRow?.user_id && walletRow.user_id !== linkProfileId) {
-        return res.status(409).json({
-          ok: false,
-          code: "WALLET_ALREADY_LINKED",
-          message: "This wallet is already linked to another profile.",
-        });
+    // Wallet gehört schon jemand anderem?
+    if (walletRow?.user_id && walletRow.user_id !== linkProfileId) {
+      return res.status(409).json({
+        ok: false,
+        code: "WALLET_ALREADY_LINKED",
+        message: "This wallet is already linked to another profile.",
+      });
+    }
+
+    // Wallet -> aktuelles Profil verlinken (nur wenn noch frei)
+    if (!walletRow?.user_id) {
+      const { data: upd, error: linkErr } = await sb
+        .from("wallets")
+        .update({ user_id: linkProfileId })
+        .eq("address", addressLower)
+        .is("user_id", null)
+        .select("user_id");
+      if (linkErr) {
+        console.error("[register] link wallet->profile failed:", linkErr);
+        return res.status(500).json({ ok: false, code: "LINK_ERROR" });
       }
-
-      if (!walletRow?.user_id) {
-        const { error: linkErr } = await sb
+      if (!upd || upd.length === 0) {
+        // lost race – reread
+        const { data: again } = await sb
           .from("wallets")
-          .update({ user_id: linkProfileId })
-          .eq("address", addressLower);
-        if (linkErr) {
-          console.error("[register] link wallet->profile failed:", linkErr);
-          return res.status(500).json({ ok: false, code: "LINK_ERROR" });
+          .select("user_id")
+          .eq("address", addressLower)
+          .maybeSingle();
+        if (!again?.user_id) {
+          return res.status(409).json({ ok: false, code: "LINK_RACE_CONFLICT" });
         }
-        profileId = linkProfileId;
-        walletRow = { ...walletRow, user_id: linkProfileId };
+        profileId = again.user_id;
       } else {
-        profileId = walletRow.user_id;
+        profileId = upd[0]?.user_id ?? linkProfileId;
       }
+      walletRow = { ...walletRow, user_id: profileId };
+    } else {
+      profileId = walletRow.user_id;
     }
   }
 
-  // 4) Standard: neues Profil anlegen & verlinken
-  if (!profileId && !linkProfileId) {
+  /* ---- 3) SIGNUP: neues Profil nur dann erzeugen, wenn Wallet noch keiner hat ---- */
+  if (intent !== "link") {
+    if (profileId) {
+      // Bereits registriert → idempotent erfolgreich
+      res.setHeader("Cache-Control", "no-store");
+      return res.status(200).json({
+        ok: true,
+        registered: true,
+        already: true,
+        address: addressLower,
+        userId: profileId,
+        keepNonce: true,
+        linked: false,
+      });
+    }
+
+    // Profil erzeugen (vorerst ohne user_id, falls ihr E-Mail separat nutzt)
     const insertPayload = creatorName ? { creator_name: creatorName } : {};
     const { data: prof, error: pErr } = await sb
       .from("profiles")
@@ -228,20 +264,40 @@ async function handler(req, res) {
       .single();
     if (pErr) {
       console.error("[register] create profile failed:", pErr);
-      return res.status(500).json({ ok: false, code: "PROFILE_UPSERT_ERROR" });
+      return res.status(500).json({ ok: false, code: "PROFILE_CREATE_ERROR" });
     }
-    profileId = prof.id;
 
-    const { error: linkErr } = await sb
+    // Wallet atomar „claimen“ (nur wenn noch frei)
+    const { data: upd, error: linkErr } = await sb
       .from("wallets")
-      .update({ user_id: profileId })
-      .eq("address", addressLower);
+      .update({ user_id: prof.id })
+      .eq("address", addressLower)
+      .is("user_id", null)
+      .select("user_id");
     if (linkErr) {
       console.error("[register] link wallet->profile failed:", linkErr);
       return res.status(500).json({ ok: false, code: "LINK_ERROR" });
     }
-  } else if (creatorName && profileId) {
-    await sb.from("profiles").update({ creator_name: creatorName }).eq("id", profileId);
+    if (!upd || upd.length === 0) {
+      // Lost race: jemand anderes hat parallel gelinkt → neu erzeugtes Profil aufräumen
+      await sb.from("profiles").delete().eq("id", prof.id).catch(() => {});
+      const { data: again } = await sb
+        .from("wallets")
+        .select("user_id")
+        .eq("address", addressLower)
+        .maybeSingle();
+      if (!again?.user_id) {
+        return res.status(409).json({ ok: false, code: "SIGNUP_RACE_CONFLICT" });
+      }
+      profileId = again.user_id;
+    } else {
+      profileId = upd[0]?.user_id ?? prof.id;
+    }
+  }
+
+  // Optional: Creator-Name nachtragen, falls vorhanden
+  if (creatorName && profileId) {
+    await sb.from("profiles").update({ creator_name: creatorName }).eq("id", profileId).catch(() => {});
   }
 
   res.setHeader("Cache-Control", "no-store");
@@ -250,7 +306,7 @@ async function handler(req, res) {
     registered: true,
     address: addressLower,
     userId: profileId ?? linkProfileId ?? null,
-    keepNonce: true,
+    keepNonce: true,    // wichtig: Verify darf danach sofort erneut erfolgen
     linked: Boolean(linkProfileId),
   });
 }
