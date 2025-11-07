@@ -75,18 +75,18 @@ function readBearer(req) {
   return m ? m[1] : null;
 }
 
-// --------- neuer, ultra-robuster SIWE-Parser (tolerant) ----------------------
+// --------- robuster SIWE-Parser (tolerant) -----------------------------------
 function parseSiweMessage(input) {
   if (!input || typeof input !== "string") return null;
 
-  // Normalisieren
-  let msg = input.replace(/\r\n/g, "\n").replace(/^\uFEFF/, ""); // CRLF -> LF, BOM raus
+  // Normalisieren: CRLF -> LF, BOM raus
+  let msg = input.replace(/\r\n/g, "\n").replace(/^\uFEFF/, "");
 
-  // domain (erste Zeile, bis zum ersten Leerzeichen)
+  // domain (erste Zeile)
   const firstLine = (msg.split("\n")[0] || "").trim();
   const domain = firstLine.split(/\s+/)[0] || "";
 
-  // address (beste Schätzung: zweit Zeile ODER regex)
+  // address (zweite Zeile oder regex fallback)
   let address = (msg.split("\n")[1] || "").trim();
   if (!/^0x[0-9a-fA-F]{40}$/.test(address)) {
     const mAddr = msg.match(/(?:^|\n)\s*(0x[a-fA-F0-9]{40})\s*(?:$|\n)/m);
@@ -108,7 +108,6 @@ function parseSiweMessage(input) {
 
   let chainId = null;
   if (chainRaw != null) {
-    // erlaubt auch Format eip155:1
     const num = chainRaw.match(/(\d+)/);
     if (num) chainId = Number(num[1]);
   }
@@ -139,7 +138,7 @@ async function handler(req, res) {
     let message = body?.message;
     const signature = body?.signature;
 
-    // Message normalisieren (falls als JSON mit "\n" kam)
+    // Message normalisieren (falls per JSON mit "\\n" kam)
     if (typeof message === "string") {
       if (message.indexOf("\r\n") !== -1) message = message.replace(/\r\n/g, "\n");
       if (message.indexOf("\\n") !== -1 && message.indexOf("\n") === -1) {
@@ -179,34 +178,72 @@ async function handler(req, res) {
 
     // Signatur prüfen
     stage(res, "ethers:import");
-    const ethersMod = await import("ethers");
-    const verify =
-      ethersMod.verifyMessage ||
-      (ethersMod.default && ethersMod.default.verifyMessage) ||
-      (ethersMod.utils && ethersMod.utils.verifyMessage);
+    let verify;
+    try {
+      const ethersMod = await import("ethers");
+      verify =
+        ethersMod.verifyMessage ||
+        (ethersMod.default && ethersMod.default.verifyMessage) ||
+        (ethersMod.utils && ethersMod.utils.verifyMessage);
+    } catch (e) {
+      stage(res, "ethers:import:throw");
+      errHdr(res, e);
+      return deny(res, 500, { ok:false, code:"VERIFY_IMPORT_THROWN" });
+    }
     if (typeof verify !== "function") return deny(res, 500, { ok:false, code:"VERIFY_UNAVAILABLE" });
 
-    stage(res, "ethers:verify");
-    const recovered = await verify(String(message), String(signature));
+    stage(res, "ethers:verify:start", { msgLen: String(message).length });
+    let recovered;
+    try {
+      recovered = await verify(String(message), String(signature));
+    } catch (e) {
+      stage(res, "ethers:verify:throw");
+      errHdr(res, e);
+      return deny(res, 400, { ok:false, code:"VERIFY_THROWN" });
+    }
+    stage(res, "ethers:verify:ok");
     if (!addrEq(recovered, siwe.address)) return deny(res, 401, { ok:false, code:"ADDRESS_MISMATCH" });
+
+    // Optional: Short-Circuit für Diagnose (ENV TEST_VERIFY_ONLY=1)
+    if (process.env.TEST_VERIFY_ONLY === "1") {
+      stage(res, "short-circuit:after-ethers");
+      return res.status(200).json({ ok:true, test:"after-ethers" });
+    }
 
     // Supabase Admin
     stage(res, "db:init");
-    const SUPABASE_URL = process.env.SUPABASE_URL;
-    const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return deny(res, 500, { ok:false, code:"SERVER_CONFIG_MISSING" });
-    const { createClient } = await import("@supabase/supabase-js");
-    const sbAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
+    let sbAdmin;
+    try {
+      const SUPABASE_URL = process.env.SUPABASE_URL;
+      const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+      if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+        return deny(res, 500, { ok:false, code:"SERVER_CONFIG_MISSING" });
+      }
+      const { createClient } = await import("@supabase/supabase-js");
+      sbAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
+    } catch (e) {
+      stage(res, "db:init:throw");
+      errHdr(res, e);
+      return deny(res, 500, { ok:false, code:"DB_INIT_THROWN" });
+    }
 
     // Wallet-Status
     stage(res, "db:check-wallet");
     const addressLower = String(siwe.address || "").toLowerCase();
-    const { data: walletRow, error: wErr } = await sbAdmin
-      .from("wallets")
-      .select("address,user_id")
-      .eq("address", addressLower)
-      .maybeSingle();
-    if (wErr) return deny(res, 500, { ok:false, code:"DB_SELECT_ERROR" });
+    let walletRow;
+    try {
+      const { data, error } = await sbAdmin
+        .from("wallets")
+        .select("address,user_id")
+        .eq("address", addressLower)
+        .maybeSingle();
+      if (error) throw error;
+      walletRow = data;
+    } catch (e) {
+      stage(res, "db:check-wallet:throw");
+      errHdr(res, e);
+      return deny(res, 500, { ok:false, code:"DB_SELECT_THROWN" });
+    }
 
     let isRegistered = !!walletRow;
     let walletUserId = walletRow?.user_id ?? null;
@@ -215,8 +252,8 @@ async function handler(req, res) {
     stage(res, "db:get-bearer");
     let emailProfileId = null;
     if (bearer) {
-      const { data: authData, error: authErr } = await sbAdmin.auth.getUser(bearer);
-      if (!authErr) {
+      try {
+        const { data: authData } = await sbAdmin.auth.getUser(bearer);
         const authUserId = authData?.user?.id || null;
         if (authUserId) {
           const { data: prof } = await sbAdmin
@@ -226,6 +263,10 @@ async function handler(req, res) {
             .maybeSingle();
           emailProfileId = prof?.id ?? null;
         }
+      } catch (e) {
+        stage(res, "db:get-bearer:throw");
+        errHdr(res, e);
+        return deny(res, 500, { ok:false, code:"SUPABASE_GETUSER_THROWN" });
       }
     }
 
