@@ -75,7 +75,7 @@ function readBearer(req) {
   return m ? m[1] : null;
 }
 
-// --------- toleranter SIWE-Parser -------------------------------------------
+// --------- toleranter SIWE-Parser --------------------------------------------
 function parseSiweMessage(input) {
   if (!input || typeof input !== "string") return null;
   let msg = input.replace(/\r\n/g, "\n").replace(/^\uFEFF/, "");
@@ -105,9 +105,23 @@ function parseSiweMessage(input) {
   return { domain, address, uri, version, chainId, nonce, issuedAt };
 }
 
+// --------- NEU: raw JSON Body reader (um req.body Getter zu vermeiden) -------
+async function readJsonBody(req) {
+  try {
+    let raw = "";
+    for await (const chunk of req) {
+      raw += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+    }
+    if (!raw) return {};
+    try { return JSON.parse(raw); } catch { return {}; }
+  } catch {
+    return {};
+  }
+}
+
 // ---- handler ----------------------------------------------------------------
 async function handler(req, res) {
-  res.setHeader("Access-Control-Expose-Headers", "X-TC-Debug, X-TC-Error, X-TC-SB-Host, X-TC-SB-Path");
+  res.setHeader("Access-Control-Expose-Headers", "X-TC-Debug, X-TC-Error, X-TC-CT");
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "POST") return res.status(405).json({ ok:false, code:"METHOD_NOT_ALLOWED" });
 
@@ -115,15 +129,14 @@ async function handler(req, res) {
     const intent = String(req.headers["x-tc-intent"] || req.headers["X-TC-Intent"] || "");
     const bearer = readBearer(req);
     stage(res, "recv", { intent, hasBearer: !!bearer });
+    setHdr(res, "X-TC-CT", String(req.headers["content-type"] || "")); // debug: eingehender content-type
 
-    // Body tolerant
-    stage(res, "parse-body:start");
-    let body = req.body;
-    if (!body || typeof body !== "object") {
-      try { body = JSON.parse(req.body || "{}"); } catch { body = {}; }
-    }
+    // Body robust einlesen (nicht req.body verwenden!)
+    stage(res, "parse-body:raw");
+    const body = await readJsonBody(req);
     let message = body?.message;
     const signature = body?.signature;
+
     if (typeof message === "string") {
       if (message.indexOf("\r\n") !== -1) message = message.replace(/\r\n/g, "\n");
       if (message.indexOf("\\n") !== -1 && message.indexOf("\n") === -1) message = message.replace(/\\n/g, "\n");
@@ -137,13 +150,12 @@ async function handler(req, res) {
     const cookieNonce = getCookie(req, COOKIE_NONCE);
     if (!cookieNonce) return deny(res, 400, { ok:false, code:"MISSING_SERVER_NONCE" });
 
-    // SIWE parse
+    // SIWE
     stage(res, "siwe:parse");
     const siwe = parseSiweMessage(String(message));
     if (!siwe) return deny(res, 400, { ok:false, code:"INVALID_SIWE_FORMAT" });
-
-    // Policy
     if (!ALLOWED_DOMAINS.has(siwe.domain)) return deny(res, 400, { ok:false, code:"DOMAIN_NOT_ALLOWED" });
+
     stage(res, "siwe:uri");
     try {
       const u = new URL(siwe.uri);
@@ -161,73 +173,43 @@ async function handler(req, res) {
       (ethersMod.default && ethersMod.default.verifyMessage) ||
       (ethersMod.utils && ethersMod.utils.verifyMessage);
     if (typeof verify !== "function") return deny(res, 500, { ok:false, code:"VERIFY_UNAVAILABLE" });
+
     stage(res, "ethers:verify");
     const recovered = await verify(String(message), String(signature));
     if (!addrEq(recovered, siwe.address)) return deny(res, 401, { ok:false, code:"ADDRESS_MISMATCH" });
 
-    // Supabase Admin – DEBUG: Host/Path mitgeben
+    // Supabase Admin
+    stage(res, "db:init");
     const SUPABASE_URL = process.env.SUPABASE_URL;
     const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-    try {
-      const u = new URL(SUPABASE_URL);
-      setHdr(res, "X-TC-SB-Host", u.host);
-      setHdr(res, "X-TC-SB-Path", u.pathname || "/");
-    } catch {}
     if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return deny(res, 500, { ok:false, code:"SERVER_CONFIG_MISSING" });
-
-    stage(res, "db:init");
-    let sbAdmin;
-    try {
-      const { createClient } = await import("@supabase/supabase-js");
-      sbAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
-      stage(res, "db:init:ok");
-    } catch (e) {
-      errHdr(res, e);
-      return deny(res, 500, { ok:false, code:"SB_INIT_FAILED" });
-    }
+    const { createClient } = await import("@supabase/supabase-js");
+    const sbAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
 
     // Wallet-Status
-    stage(res, "db:check-wallet:call");
+    stage(res, "db:check-wallet");
     const addressLower = String(siwe.address || "").toLowerCase();
-    let walletRow, wErr;
-    try {
-      const resW = await sbAdmin
-        .from("wallets")
-        .select("address,user_id")
-        .eq("address", addressLower)
-        .maybeSingle();
-      walletRow = resW.data; wErr = resW.error;
-    } catch (e) {
-      errHdr(res, e);
-      return deny(res, 500, { ok:false, code:"DB_SELECT_THROW" });
-    }
+    const { data: walletRow, error: wErr } = await sbAdmin
+      .from("wallets")
+      .select("address,user_id")
+      .eq("address", addressLower)
+      .maybeSingle();
     if (wErr) return deny(res, 500, { ok:false, code:"DB_SELECT_ERROR" });
 
     let isRegistered = !!walletRow;
     let walletUserId = walletRow?.user_id ?? null;
 
     // aktive E-Mail Session?
-    stage(res, "db:get-bearer:call");
+    stage(res, "db:get-bearer");
     let emailProfileId = null;
     if (bearer) {
-      try {
-        const { data: authData, error: authErr } = await sbAdmin.auth.getUser(bearer);
-        stage(res, "db:get-bearer:ok", { hasError: !!authErr });
-        if (!authErr) {
-          const authUserId = authData?.user?.id || null;
-          if (authUserId) {
-            const { data: prof } = await sbAdmin
-              .from("profiles")
-              .select("id")
-              .eq("user_id", authUserId)
-              .maybeSingle();
-            emailProfileId = prof?.id ?? null;
-          }
+      const { data: authData, error: authErr } = await sbAdmin.auth.getUser(bearer);
+      if (!authErr) {
+        const authUserId = authData?.user?.id || null;
+        if (authUserId) {
+          const { data: prof } = await sbAdmin.from("profiles").select("id").eq("user_id", authUserId).maybeSingle();
+          emailProfileId = prof?.id ?? null;
         }
-      } catch (e) {
-        stage(res, "db:get-bearer:throw");
-        errHdr(res, e);
-        return deny(res, 500, { ok:false, code:"AUTH_GETUSER_FAILED" });
       }
     }
 
@@ -235,9 +217,11 @@ async function handler(req, res) {
     if (intent === "link") {
       stage(res, "link:begin", { hasBearer: !!bearer, emailProfileId: !!emailProfileId });
       if (!bearer || !emailProfileId) return deny(res, 403, { ok:false, code:"LINK_REQUIRES_VALID_BEARER" });
+
       if (walletUserId && walletUserId !== emailProfileId) {
         return deny(res, 409, { ok:false, code:"WALLET_ALREADY_LINKED", message:"This wallet is already linked to another profile." });
       }
+
       if (!isRegistered) {
         const { error: insErr } = await sbAdmin.from("wallets").insert({ address: addressLower, user_id: emailProfileId });
         if (insErr) {
@@ -246,7 +230,8 @@ async function handler(req, res) {
           if (uid && uid !== emailProfileId) return deny(res, 409, { ok:false, code:"WALLET_ALREADY_LINKED", message:"This wallet is already linked to another profile." });
           if (!uid) return deny(res, 500, { ok:false, code:"DB_UPSERT_ERROR" });
         }
-        isRegistered = true; walletUserId = emailProfileId;
+        isRegistered = true;
+        walletUserId = emailProfileId;
       } else if (!walletUserId) {
         const { data: upd, error: linkErr } = await sbAdmin
           .from("wallets").update({ user_id: emailProfileId })
@@ -272,26 +257,18 @@ async function handler(req, res) {
       }
     }
 
-    // userId final
-    stage(res, "user:resolve");
-    let userId = walletUserId ?? null;
-    if (!userId && isRegistered) {
-      const { data: row2 } = await sbAdmin.from("wallets").select("user_id").eq("address", addressLower).maybeSingle();
-      userId = row2?.user_id ?? null;
-    }
-    if (!userId) return deny(res, 403, { ok:false, code:"NO_USER_FOR_WALLET", message:"Wallet has no associated user. Link required." });
-
     // Session
     stage(res, "session:set");
-    const payload = { v: 1, addr: addressLower, userId, ts: Date.now(), exp: Date.now() + SESSION_TTL_SEC * 1000 };
+    const payload = { v: 1, addr: addressLower, userId: walletUserId, ts: Date.now(), exp: Date.now() + SESSION_TTL_SEC * 1000 };
     const raw = JSON.stringify(payload);
     const sig = sign(raw);
     const sessionValue = Buffer.from(JSON.stringify(sig ? { raw, sig } : { raw })).toString("base64");
+
     clearCookie(res, COOKIE_NONCE);
     setCookie(res, COOKIE_SESSION, sessionValue, { maxAgeSec: SESSION_TTL_SEC });
 
     stage(res, "ok");
-    return res.status(200).json({ ok:true, address: addressLower, userId, linked: intent === "link" });
+    return res.status(200).json({ ok:true, address: addressLower, userId: walletUserId, linked: intent === "link" });
   } catch (e) {
     console.error("[SIWE verify] unexpected error:", e);
     stage(res, "unexpected");
