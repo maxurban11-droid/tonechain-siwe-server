@@ -8,41 +8,7 @@ const ALLOWED_DOMAINS = new Set([
 ]);
 const CACHE_TTL_SEC = 60 * 5; // 5 Minuten
 
-// ... (CORS & Validierung wie gehabt)
-
-const auth = req.headers.authorization || "";
-const m = auth.match(/^Bearer\s+(.+)$/i);
-const bearer = m ? m[1] : null;
-
-const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
-
-let linkedToMe = undefined; // nur gesetzt, wenn Bearer vorhanden
-let myProfileId = null;
-
-if (bearer) {
-  const { data: authData } = await sb.auth.getUser(bearer);
-  const authUserId = authData?.user?.id || null;
-  if (authUserId) {
-    const { data: prof } = await sb.from("profiles").select("id").eq("user_id", authUserId).maybeSingle();
-    myProfileId = prof?.id ?? null;
-  }
-}
-
-const { data: w, error } = await sb.from("wallets").select("user_id").eq("address", address).maybeSingle();
-if (error) {
-  console.error("[exists] DB query failed:", error);
-  return res.status(500).json({ ok: false, code: "DB_ERROR" });
-}
-
-const exists = !!w;
-if (bearer) {
-  linkedToMe = exists && myProfileId ? w?.user_id === myProfileId : false;
-}
-
-res.setHeader("Cache-Control", `public, max-age=60`); // optional
-return res.status(200).json({ ok: true, exists, ...(bearer ? { linkedToMe } : {}) });
-
-/* ===== kleine Helfer ===== */
+/* ===== Helfer: Origin-Whitelist ===== */
 function originAllowed(origin) {
   try {
     if (!origin) return false;
@@ -67,10 +33,10 @@ function originAllowed(origin) {
 
 /* ===== Handler ===== */
 export default async function handler(req, res) {
-  const origin = req.headers.origin || "";
+  const origin = req.headers.origin || req.headers.Origin || "";
   const allowed = originAllowed(origin);
 
-  // --- CORS ---
+  // --- CORS Grundgerüst ---
   res.setHeader("Vary", "Origin");
   if (allowed) {
     res.setHeader("Access-Control-Allow-Origin", origin);
@@ -81,18 +47,14 @@ export default async function handler(req, res) {
     "Access-Control-Allow-Headers",
     "Content-Type, Authorization, X-TC-Intent"
   );
-
   if (req.method === "OPTIONS") {
-    // Preflight immer kurz beantworten
     return res.status(204).end();
   }
-
   if (req.method !== "GET") {
     return res
       .status(405)
       .json({ ok: false, code: "METHOD_NOT_ALLOWED", message: "Use GET" });
   }
-
   // Origin-Gate (nach Preflight)
   if (!allowed) {
     return res.status(403).json({
@@ -102,7 +64,7 @@ export default async function handler(req, res) {
     });
   }
 
-  // ENV prüfen
+  // --- ENV prüfen (Admin-Client) ---
   const SUPABASE_URL = process.env.SUPABASE_URL;
   const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
@@ -111,34 +73,57 @@ export default async function handler(req, res) {
       .json({ ok: false, code: "SERVER_CONFIG_MISSING" });
   }
 
-  // Adresse prüfen
+  // --- Adresse prüfen ---
   const raw = String(req.query.address || "").trim();
   if (!raw) {
-    return res.status(400).json({
-      ok: false,
-      code: "MISSING_ADDRESS",
-      message: "Missing ?address",
-    });
+    return res
+      .status(400)
+      .json({ ok: false, code: "MISSING_ADDRESS", message: "Missing ?address" });
   }
-
   const address = raw.toLowerCase();
-  if (!/^0x[0-9a-f]{40}$/i.test(address)) {
-    return res.status(400).json({
-      ok: false,
-      code: "INVALID_ADDRESS",
-      message: "Invalid wallet",
-    });
+  if (!/^0x[0-9a-f]{40}$/.test(address)) {
+    return res
+      .status(400)
+      .json({ ok: false, code: "INVALID_ADDRESS", message: "Invalid wallet" });
   }
 
-  // Supabase
+  // --- optionaler Bearer (für linkedToMe) ---
+  const auth =
+    req.headers.authorization ||
+    req.headers.Authorization ||
+    "";
+  const m = String(auth).match(/^Bearer\s+(.+)$/i);
+  const bearer = m ? m[1] : null;
+
+  // --- Supabase Admin-Client ---
   const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
     auth: { persistSession: false },
   });
 
   try {
-    const { data, error } = await sb
+    // Wenn Bearer vorhanden: aktuelles Profil ermitteln
+    let myProfileId = null;
+    if (bearer) {
+      try {
+        const { data: authData } = await sb.auth.getUser(bearer);
+        const authUserId = authData?.user?.id || null;
+        if (authUserId) {
+          const { data: prof } = await sb
+            .from("profiles")
+            .select("id")
+            .eq("user_id", authUserId)
+            .maybeSingle();
+          myProfileId = prof?.id ?? null;
+        }
+      } catch {
+        // absichtlich stumm – linkedToMe fällt dann auf false zurück
+      }
+    }
+
+    // Wallet nachschlagen (immer in lower-case)
+    const { data: w, error } = await sb
       .from("wallets")
-      .select("address")
+      .select("user_id")
       .eq("address", address)
       .maybeSingle();
 
@@ -149,12 +134,23 @@ export default async function handler(req, res) {
         .json({ ok: false, code: "DB_ERROR", message: error.message });
     }
 
-    const exists = !!data;
+    const exists = !!w;
+    // Nur wenn Bearer mitgesendet wurde, linkedToMe berechnen
+    const body =
+      bearer && myProfileId
+        ? { ok: true, exists, linkedToMe: exists ? w?.user_id === myProfileId : false }
+        : { ok: true, exists };
 
-    // leichtes Edge/Browser-Caching (optional)
-    res.setHeader("Cache-Control", `public, max-age=${CACHE_TTL_SEC}`);
+    // Caching:
+    // - mit Bearer (nutzerbezogen): no-store
+    // - ohne Bearer: public Cache
+    if (bearer) {
+      res.setHeader("Cache-Control", "no-store");
+    } else {
+      res.setHeader("Cache-Control", `public, max-age=${CACHE_TTL_SEC}, must-revalidate`);
+    }
 
-    return res.status(200).json({ ok: true, exists });
+    return res.status(200).json(body);
   } catch (e) {
     console.error("[exists] Unexpected error:", e);
     return res.status(500).json({
@@ -165,5 +161,5 @@ export default async function handler(req, res) {
   }
 }
 
-// Sicherstellen, dass Vercel nicht als Edge läuft
+// Sicherstellen, dass Vercel Node (nicht Edge) nutzt
 export const config = { runtime: "nodejs" };
