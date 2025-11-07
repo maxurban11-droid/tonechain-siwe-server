@@ -170,7 +170,7 @@ async function handler(req, res) {
     } catch { return deny(res, 400, { ok:false, code:"URI_NOT_ALLOWED" }); }
     if (!ALLOWED_CHAINS.has(Number(siwe.chainId))) return deny(res, 400, { ok:false, code:"CHAIN_NOT_ALLOWED" });
     if (!withinAge(siwe.issuedAt)) return deny(res, 400, { ok:false, code:"MESSAGE_TOO_OLD" });
-    iif (siwe.nonce !== serverNonce) {
+    if (siwe.nonce !== serverNonce) {
       return deny(res, 401, { ok:false, code:"NONCE_MISMATCH" });
     }
     // Signatur prüfen
