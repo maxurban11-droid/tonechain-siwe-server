@@ -1,5 +1,5 @@
 // api/auth/verify.js
-// SIWE Verify (mit Link-Unterstützung), robuste Debug-Stages, Node runtime.
+// SIWE Verify (mit Link-Unterstützung) – präzise Debug-Stages & robuste Catch-Punkte.
 
 import crypto from "node:crypto";
 import { withCors } from "../../helpers/cors.js";
@@ -18,8 +18,9 @@ const COOKIE_SESSION = "tc_session";
 const SESSION_TTL_SEC = 60 * 60 * 24;
 const SESSION_SECRET = process.env.SESSION_SECRET || null;
 
-// ---- Debug helpers ----------------------------------------------------------
 const DEBUG_SIWE = process.env.DEBUG_SIWE === "1";
+
+// ---------- small utils ----------
 function setHdr(res, k, v) { try { res.setHeader(k, v); } catch {} }
 function stage(res, label, extra) {
   setHdr(res, "X-TC-Debug", label);
@@ -31,8 +32,6 @@ function errHdr(res, e) {
   const msg = (e && (e.body || e.message)) ? String(e.body || e.message) : String(e);
   setHdr(res, "X-TC-Error", msg.slice(0, 240));
 }
-
-// ---- helpers ----------------------------------------------------------------
 function sign(val) {
   if (!SESSION_SECRET) return null;
   return crypto.createHmac("sha256", SESSION_SECRET).update(val).digest("hex");
@@ -75,25 +74,19 @@ function readBearer(req) {
   return m ? m[1] : null;
 }
 
-// --------- robuster SIWE-Parser (tolerant) -----------------------------------
+// toleranter SIWE-Parser (Linebreaks normalisiert)
 function parseSiweMessage(input) {
   if (!input || typeof input !== "string") return null;
-
-  // Normalisieren: CRLF -> LF, BOM raus
   let msg = input.replace(/\r\n/g, "\n").replace(/^\uFEFF/, "");
-
-  // domain (erste Zeile)
   const firstLine = (msg.split("\n")[0] || "").trim();
   const domain = firstLine.split(/\s+/)[0] || "";
 
-  // address (zweite Zeile oder regex fallback)
   let address = (msg.split("\n")[1] || "").trim();
   if (!/^0x[0-9a-fA-F]{40}$/.test(address)) {
     const mAddr = msg.match(/(?:^|\n)\s*(0x[a-fA-F0-9]{40})\s*(?:$|\n)/m);
     address = mAddr ? mAddr[1] : "";
   }
 
-  // generischer Feldleser (case/space-insensitiv)
   const pick = (labelRe) => {
     const re = new RegExp(`(?:^|\\n)${labelRe}\\s*:\\s*([^\\n]+)`, "i");
     const m = msg.match(re);
@@ -112,15 +105,14 @@ function parseSiweMessage(input) {
     if (num) chainId = Number(num[1]);
   }
 
-  if (!domain || !address || !uri || !version || !chainId || !nonce || !issuedAt) {
-    return null;
-  }
+  if (!domain || !address || !uri || !version || !chainId || !nonce || !issuedAt) return null;
   return { domain, address, uri, version, chainId, nonce, issuedAt };
 }
 
-// ---- handler ----------------------------------------------------------------
+// ---------- handler ----------
 async function handler(req, res) {
   res.setHeader("Access-Control-Expose-Headers", "X-TC-Debug, X-TC-Error");
+
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "POST") return res.status(405).json({ ok:false, code:"METHOD_NOT_ALLOWED" });
 
@@ -129,7 +121,7 @@ async function handler(req, res) {
     const bearer = readBearer(req);
     stage(res, "recv", { intent, hasBearer: !!bearer });
 
-    // Body tolerant
+    // Body tolerant parsen + normalisieren
     stage(res, "parse-body:start");
     let body = req.body;
     if (!body || typeof body !== "object") {
@@ -138,37 +130,29 @@ async function handler(req, res) {
     let message = body?.message;
     const signature = body?.signature;
 
-    // Message normalisieren (falls per JSON mit "\\n" kam)
     if (typeof message === "string") {
       if (message.indexOf("\r\n") !== -1) message = message.replace(/\r\n/g, "\n");
-      if (message.indexOf("\\n") !== -1 && message.indexOf("\n") === -1) {
-        message = message.replace(/\\n/g, "\n");
-      }
+      if (message.indexOf("\\n") !== -1 && message.indexOf("\n") === -1) message = message.replace(/\\n/g, "\n");
       message = message.replace(/^\uFEFF/, "");
     }
     if (!message || !signature) return deny(res, 400, { ok:false, code:"INVALID_PAYLOAD" });
-
     stage(res, "parse-body:ok", { msgLen: String(message).length });
 
-    // Nonce
+    // Nonce prüfen
     stage(res, "nonce:get");
     const cookieNonce = getCookie(req, COOKIE_NONCE);
     if (!cookieNonce) return deny(res, 400, { ok:false, code:"MISSING_SERVER_NONCE" });
 
-    // SIWE parse
+    // SIWE parse + Policy
     stage(res, "siwe:parse");
     const siwe = parseSiweMessage(String(message));
     if (!siwe) return deny(res, 400, { ok:false, code:"INVALID_SIWE_FORMAT" });
-
-    // Policy
     if (!ALLOWED_DOMAINS.has(siwe.domain)) return deny(res, 400, { ok:false, code:"DOMAIN_NOT_ALLOWED" });
 
     stage(res, "siwe:uri");
     try {
       const u = new URL(siwe.uri);
-      if (!ALLOWED_URI_PREFIXES.some(p => u.href.startsWith(p))) {
-        return deny(res, 400, { ok:false, code:"URI_NOT_ALLOWED" });
-      }
+      if (!ALLOWED_URI_PREFIXES.some(p => u.href.startsWith(p))) return deny(res, 400, { ok:false, code:"URI_NOT_ALLOWED" });
     } catch {
       return deny(res, 400, { ok:false, code:"URI_NOT_ALLOWED" });
     }
@@ -176,101 +160,78 @@ async function handler(req, res) {
     if (!withinAge(siwe.issuedAt)) return deny(res, 400, { ok:false, code:"MESSAGE_TOO_OLD" });
     if (siwe.nonce !== cookieNonce) return deny(res, 401, { ok:false, code:"NONCE_MISMATCH" });
 
-    // Signatur prüfen
+    // Ethers Verify
     stage(res, "ethers:import");
-    let verify;
-    try {
-      const ethersMod = await import("ethers");
-      verify =
-        ethersMod.verifyMessage ||
-        (ethersMod.default && ethersMod.default.verifyMessage) ||
-        (ethersMod.utils && ethersMod.utils.verifyMessage);
-    } catch (e) {
-      stage(res, "ethers:import:throw");
-      errHdr(res, e);
-      return deny(res, 500, { ok:false, code:"VERIFY_IMPORT_THROWN" });
-    }
+    const ethersMod = await import("ethers");
+    const verify =
+      ethersMod.verifyMessage ||
+      (ethersMod.default && ethersMod.default.verifyMessage) ||
+      (ethersMod.utils && ethersMod.utils.verifyMessage);
     if (typeof verify !== "function") return deny(res, 500, { ok:false, code:"VERIFY_UNAVAILABLE" });
 
-    stage(res, "ethers:verify:start", { msgLen: String(message).length });
-    let recovered;
-    try {
-      recovered = await verify(String(message), String(signature));
-    } catch (e) {
-      stage(res, "ethers:verify:throw");
-      errHdr(res, e);
-      return deny(res, 400, { ok:false, code:"VERIFY_THROWN" });
-    }
-    stage(res, "ethers:verify:ok");
+    stage(res, "ethers:verify");
+    const recovered = await verify(String(message), String(signature));
     if (!addrEq(recovered, siwe.address)) return deny(res, 401, { ok:false, code:"ADDRESS_MISMATCH" });
 
-    // Optional: Short-Circuit für Diagnose (ENV TEST_VERIFY_ONLY=1)
-    if (process.env.TEST_VERIFY_ONLY === "1") {
-      stage(res, "short-circuit:after-ethers");
-      return res.status(200).json({ ok:true, test:"after-ethers" });
-    }
-
-    // Supabase Admin
+    // Supabase init
     stage(res, "db:init");
-    let sbAdmin;
-    try {
-      const SUPABASE_URL = process.env.SUPABASE_URL;
-      const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-      if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-        return deny(res, 500, { ok:false, code:"SERVER_CONFIG_MISSING" });
-      }
-      const { createClient } = await import("@supabase/supabase-js");
-      sbAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
-    } catch (e) {
-      stage(res, "db:init:throw");
-      errHdr(res, e);
-      return deny(res, 500, { ok:false, code:"DB_INIT_THROWN" });
+    const SUPABASE_URL = process.env.SUPABASE_URL;
+    const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return deny(res, 500, { ok:false, code:"SERVER_CONFIG_MISSING" });
+    // Hinweis, ohne Secrets zu leaken
+    if (/\/rest\/v1|\/auth\/v1/i.test(SUPABASE_URL)) {
+      errHdr(res, "SUPABASE_URL_SUSPICIOUS: should be https://<ref>.supabase.co");
     }
+    const { createClient } = await import("@supabase/supabase-js");
+    const sbAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
 
-    // Wallet-Status
+    // Wallet lesen
     stage(res, "db:check-wallet");
-    const addressLower = String(siwe.address || "").toLowerCase();
-    let walletRow;
+    let walletRow = null;
     try {
       const { data, error } = await sbAdmin
         .from("wallets")
         .select("address,user_id")
-        .eq("address", addressLower)
+        .eq("address", String(siwe.address || "").toLowerCase())
         .maybeSingle();
-      if (error) throw error;
-      walletRow = data;
+      if (error) {
+        errHdr(res, error);
+        return deny(res, 500, { ok:false, code:"DB_SELECT_ERROR" });
+      }
+      walletRow = data || null;
     } catch (e) {
-      stage(res, "db:check-wallet:throw");
-      errHdr(res, e);
+      errHdr(res, "DB_SELECT_THROWN:" + (e?.message || e));
       return deny(res, 500, { ok:false, code:"DB_SELECT_THROWN" });
     }
 
     let isRegistered = !!walletRow;
     let walletUserId = walletRow?.user_id ?? null;
 
-    // aktive E-Mail Session?
+    // aktiver E-Mail-Bearer?
     stage(res, "db:get-bearer");
     let emailProfileId = null;
     if (bearer) {
       try {
-        const { data: authData } = await sbAdmin.auth.getUser(bearer);
-        const authUserId = authData?.user?.id || null;
+        const { data: authData, error: authErr } = await sbAdmin.auth.getUser(bearer);
+        if (authErr) errHdr(res, authErr);
+        const authUserId = authErr ? null : (authData?.user?.id || null);
         if (authUserId) {
-          const { data: prof } = await sbAdmin
+          const { data: prof, error: pErr } = await sbAdmin
             .from("profiles")
             .select("id")
             .eq("user_id", authUserId)
             .maybeSingle();
+          if (pErr) errHdr(res, pErr);
           emailProfileId = prof?.id ?? null;
         }
       } catch (e) {
-        stage(res, "db:get-bearer:throw");
-        errHdr(res, e);
+        errHdr(res, "SUPABASE_GETUSER_THROWN:" + (e?.message || e));
         return deny(res, 500, { ok:false, code:"SUPABASE_GETUSER_THROWN" });
       }
     }
 
-    // LINK
+    // LINK-Modus
+    const addressLower = String(siwe.address || "").toLowerCase();
     if (intent === "link") {
       stage(res, "link:begin", { hasBearer: !!bearer, emailProfileId: !!emailProfileId });
       if (!bearer || !emailProfileId) return deny(res, 403, { ok:false, code:"LINK_REQUIRES_VALID_BEARER" });
@@ -280,48 +241,57 @@ async function handler(req, res) {
       }
 
       if (!isRegistered) {
-        const { error: insErr } = await sbAdmin
-          .from("wallets")
-          .insert({ address: addressLower, user_id: emailProfileId });
-        if (insErr) {
-          const { data: again } = await sbAdmin
+        try {
+          const { error: insErr } = await sbAdmin
             .from("wallets")
-            .select("address,user_id")
-            .eq("address", addressLower)
-            .maybeSingle();
-          const uid = again?.user_id ?? null;
-          if (uid && uid !== emailProfileId) {
-            return deny(res, 409, { ok:false, code:"WALLET_ALREADY_LINKED", message:"This wallet is already linked to another profile." });
+            .insert({ address: addressLower, user_id: emailProfileId });
+          if (insErr) {
+            const { data: again } = await sbAdmin
+              .from("wallets")
+              .select("address,user_id")
+              .eq("address", addressLower)
+              .maybeSingle();
+            const uid = again?.user_id ?? null;
+            if (uid && uid !== emailProfileId) {
+              return deny(res, 409, { ok:false, code:"WALLET_ALREADY_LINKED", message:"This wallet is already linked to another profile." });
+            }
+            if (!uid) return deny(res, 500, { ok:false, code:"DB_UPSERT_ERROR" });
           }
-          if (!uid) return deny(res, 500, { ok:false, code:"DB_UPSERT_ERROR" });
+          isRegistered = true; walletUserId = emailProfileId;
+        } catch (e) {
+          errHdr(res, "DB_INSERT_THROWN:" + (e?.message || e));
+          return deny(res, 500, { ok:false, code:"DB_INSERT_THROWN" });
         }
-        isRegistered = true;
-        walletUserId = emailProfileId;
       } else if (!walletUserId) {
-        const { data: upd, error: linkErr } = await sbAdmin
-          .from("wallets")
-          .update({ user_id: emailProfileId })
-          .eq("address", addressLower)
-          .is("user_id", null)
-          .select("user_id");
-        if (linkErr) return deny(res, 500, { ok:false, code:"LINK_ERROR" });
-        if (!upd || upd.length === 0) {
-          const { data: again } = await sbAdmin
+        try {
+          const { data: upd, error: linkErr } = await sbAdmin
             .from("wallets")
-            .select("address,user_id")
+            .update({ user_id: emailProfileId })
             .eq("address", addressLower)
-            .maybeSingle();
-          const uid = again?.user_id ?? null;
-          if (uid && uid !== emailProfileId) {
-            return deny(res, 409, { ok:false, code:"WALLET_ALREADY_LINKED", message:"This wallet is already linked to another profile." });
+            .is("user_id", null)
+            .select("user_id");
+          if (linkErr) return deny(res, 500, { ok:false, code:"LINK_ERROR" });
+          if (!upd || upd.length === 0) {
+            const { data: again } = await sbAdmin
+              .from("wallets")
+              .select("address,user_id")
+              .eq("address", addressLower)
+              .maybeSingle();
+            const uid = again?.user_id ?? null;
+            if (uid && uid !== emailProfileId) {
+              return deny(res, 409, { ok:false, code:"WALLET_ALREADY_LINKED", message:"This wallet is already linked to another profile." });
+            }
+            if (!uid) return deny(res, 500, { ok:false, code:"LINK_ERROR" });
           }
-          if (!uid) return deny(res, 500, { ok:false, code:"LINK_ERROR" });
+          walletUserId = emailProfileId;
+        } catch (e) {
+          errHdr(res, "DB_UPDATE_THROWN:" + (e?.message || e));
+          return deny(res, 500, { ok:false, code:"DB_UPDATE_THROWN" });
         }
-        walletUserId = emailProfileId;
       }
     }
 
-    // NORMAL
+    // NORMAL-Gate
     if (intent !== "link") {
       stage(res, "normal:gate", { isRegistered, walletUserId, emailProfileId: !!emailProfileId });
       if (!isRegistered) return deny(res, 403, { ok:false, code:"WALLET_NOT_REGISTERED", message:"No account found for this wallet. Please sign up or link first." });
@@ -335,16 +305,21 @@ async function handler(req, res) {
     stage(res, "user:resolve");
     let userId = walletUserId ?? null;
     if (!userId && isRegistered) {
-      const { data: row2 } = await sbAdmin
-        .from("wallets")
-        .select("user_id")
-        .eq("address", addressLower)
-        .maybeSingle();
-      userId = row2?.user_id ?? null;
+      try {
+        const { data: row2 } = await sbAdmin
+          .from("wallets")
+          .select("user_id")
+          .eq("address", addressLower)
+          .maybeSingle();
+        userId = row2?.user_id ?? null;
+      } catch (e) {
+        errHdr(res, "DB_RESOLVE_THROWN:" + (e?.message || e));
+        return deny(res, 500, { ok:false, code:"DB_RESOLVE_THROWN" });
+      }
     }
     if (!userId) return deny(res, 403, { ok:false, code:"NO_USER_FOR_WALLET", message:"Wallet has no associated user. Link required." });
 
-    // Session
+    // Session setzen
     stage(res, "session:set");
     const payload = { v: 1, addr: addressLower, userId, ts: Date.now(), exp: Date.now() + SESSION_TTL_SEC * 1000 };
     const raw = JSON.stringify(payload);
