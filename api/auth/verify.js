@@ -129,7 +129,7 @@ async function handler(req, res) {
       if (message.indexOf("\\n") !== -1 && message.indexOf("\n") === -1) {
         message = message.replace(/\\n/g, "\n");
       }
-    }
+    } 
 
     if (!message || !signature) return deny(res, 400, { ok:false, code:"INVALID_PAYLOAD" });
     
@@ -304,6 +304,7 @@ async function handler(req, res) {
     return deny(res, 500, { ok:false, code:"INTERNAL_ERROR" });
   }
 }
+
 
 export default withCors(handler);
 export const config = { runtime: "nodejs" };
