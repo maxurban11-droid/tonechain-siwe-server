@@ -148,7 +148,14 @@ async function handler(req, res) {
     // Nonce
     stage(res, "nonce:get");
     const cookieNonce = getCookie(req, COOKIE_NONCE);
-    if (!cookieNonce) return deny(res, 400, { ok:false, code:"MISSING_SERVER_NONCE" });
+    const headerNonce = (req.headers["x-tc-nonce"] ? String(req.headers["x-tc-nonce"]) : "").trim() || null;
+    const serverNonce = cookieNonce || headerNonce;
+
+    setHdr(res, "X-TC-Nonce-Source", cookieNonce ? "cookie" : (headerNonce ? "header" : "none"));
+
+    if (!serverNonce) {
+      return deny(res, 400, { ok:false, code:"MISSING_SERVER_NONCE" });
+    }
 
     // SIWE
     stage(res, "siwe:parse");
@@ -163,8 +170,9 @@ async function handler(req, res) {
     } catch { return deny(res, 400, { ok:false, code:"URI_NOT_ALLOWED" }); }
     if (!ALLOWED_CHAINS.has(Number(siwe.chainId))) return deny(res, 400, { ok:false, code:"CHAIN_NOT_ALLOWED" });
     if (!withinAge(siwe.issuedAt)) return deny(res, 400, { ok:false, code:"MESSAGE_TOO_OLD" });
-    if (siwe.nonce !== cookieNonce) return deny(res, 401, { ok:false, code:"NONCE_MISMATCH" });
-
+    iif (siwe.nonce !== serverNonce) {
+      return deny(res, 401, { ok:false, code:"NONCE_MISMATCH" });
+    }
     // Signatur prüfen
     stage(res, "ethers:import");
     const ethersMod = await import("ethers");
