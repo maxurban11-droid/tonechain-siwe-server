@@ -177,6 +177,11 @@ async function handler(req, res) {
     stage(res, "db:init");
     const SUPABASE_URL = process.env.SUPABASE_URL;
     const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    try {
+      const u = new URL(SUPABASE_URL);
+      setHdr(res, "X-TC-SB-Host", u.host);
+      setHdr(res, "X-TC-SB-Path", u.pathname || "/");
+    } catch {}
     if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return deny(res, 500, { ok:false, code:"SERVER_CONFIG_MISSING" });
     // Hinweis, ohne Secrets zu leaken
     if (/\/rest\/v1|\/auth\/v1/i.test(SUPABASE_URL)) {
@@ -211,22 +216,26 @@ async function handler(req, res) {
     stage(res, "db:get-bearer");
     let emailProfileId = null;
     if (bearer) {
+      stage(res, "db:get-bearer:call");
       try {
         const { data: authData, error: authErr } = await sbAdmin.auth.getUser(bearer);
-        if (authErr) errHdr(res, authErr);
-        const authUserId = authErr ? null : (authData?.user?.id || null);
-        if (authUserId) {
-          const { data: prof, error: pErr } = await sbAdmin
-            .from("profiles")
-            .select("id")
-            .eq("user_id", authUserId)
-            .maybeSingle();
-          if (pErr) errHdr(res, pErr);
-          emailProfileId = prof?.id ?? null;
+        stage(res, "db:get-bearer:ok", { hasError: !!authErr });
+        if (!authErr) {
+          const authUserId = authData?.user?.id || null;
+          if (authUserId) {
+            const { data: prof } = await sbAdmin
+              .from("profiles")
+              .select("id")
+              .eq("user_id", authUserId)
+              .maybeSingle();
+            emailProfileId = prof?.id ?? null;
+          }
         }
       } catch (e) {
-        errHdr(res, "SUPABASE_GETUSER_THROWN:" + (e?.message || e));
-        return deny(res, 500, { ok:false, code:"SUPABASE_GETUSER_THROWN" });
+        // Falls genau hier „invalid media type“ entsteht, sehen wir es eindeutig
+        stage(res, "db:get-bearer:throw");
+        errHdr(res, e);
+        return deny(res, 500, { ok: false, code: "AUTH_GETUSER_FAILED" });
       }
     }
 
