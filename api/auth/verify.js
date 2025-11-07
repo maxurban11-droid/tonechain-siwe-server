@@ -20,7 +20,6 @@ const SESSION_SECRET = process.env.SESSION_SECRET || null;
 
 // ---- Debug helpers ----------------------------------------------------------
 const DEBUG_SIWE = process.env.DEBUG_SIWE === "1";
-
 function setHdr(res, k, v) { try { res.setHeader(k, v); } catch {} }
 function stage(res, label, extra) {
   setHdr(res, "X-TC-Debug", label);
@@ -30,7 +29,6 @@ function stage(res, label, extra) {
 }
 function errHdr(res, e) {
   const msg = (e && (e.body || e.message)) ? String(e.body || e.message) : String(e);
-  // nicht zu lang in Headern
   setHdr(res, "X-TC-Error", msg.slice(0, 240));
 }
 
@@ -58,7 +56,6 @@ function getCookie(req, name) {
   const raw = req.headers.cookie || "";
   const hit = raw.split(/;\s*/).find(s => s.startsWith(name + "="));
   if (!hit) return null;
-  // Cookie ist base64url – decodeURIComponent kann bei '%' crashen → defensiv
   const val = hit.split("=").slice(1).join("=");
   try { return decodeURIComponent(val); } catch { return val; }
 }
@@ -77,29 +74,49 @@ function readBearer(req) {
   const m = String(h).match(/^Bearer\s+(.+)$/i);
   return m ? m[1] : null;
 }
-function parseSiweMessage(msg) {
-  const lines = String(msg || "").split("\n");
-  if (lines.length < 2) return null;
-  const domain  = (lines[0] || "").split(" ")[0] || "";
-  const address = (lines[1] || "").trim();
-  let i = 2;
-  while (i < lines.length && !/^[A-Za-z ]+:\s/.test(lines[i])) i++;
-  const fields = {};
-  for (; i < lines.length; i++) {
-    const row = lines[i]; const idx = row.indexOf(":"); if (idx === -1) continue;
-    const k = row.slice(0, idx).trim().toLowerCase(); const v = row.slice(idx + 1).trim();
-    fields[k] = v;
+
+// --------- neuer, ultra-robuster SIWE-Parser (tolerant) ----------------------
+function parseSiweMessage(input) {
+  if (!input || typeof input !== "string") return null;
+
+  // Normalisieren
+  let msg = input.replace(/\r\n/g, "\n").replace(/^\uFEFF/, ""); // CRLF -> LF, BOM raus
+
+  // domain (erste Zeile, bis zum ersten Leerzeichen)
+  const firstLine = (msg.split("\n")[0] || "").trim();
+  const domain = firstLine.split(/\s+/)[0] || "";
+
+  // address (beste Schätzung: zweit Zeile ODER regex)
+  let address = (msg.split("\n")[1] || "").trim();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(address)) {
+    const mAddr = msg.match(/(?:^|\n)\s*(0x[a-fA-F0-9]{40})\s*(?:$|\n)/m);
+    address = mAddr ? mAddr[1] : "";
   }
-  const out = {
-    domain, address,
-    uri: fields["uri"],
-    version: fields["version"],
-    chainId: Number(fields["chain id"]),
-    nonce: fields["nonce"],
-    issuedAt: fields["issued at"],
+
+  // generischer Feldleser (case/space-insensitiv)
+  const pick = (labelRe) => {
+    const re = new RegExp(`(?:^|\\n)${labelRe}\\s*:\\s*([^\\n]+)`, "i");
+    const m = msg.match(re);
+    return m ? m[1].trim() : null;
   };
-  if (!out.domain || !out.address || !out.uri || !out.version || !out.chainId || !out.nonce || !out.issuedAt) return null;
-  return out;
+
+  const uri = pick("(?:URI)");
+  const version = pick("(?:Version)");
+  const chainRaw = pick("(?:Chain\\s*ID|ChainID|Chain-?ID)");
+  const nonce = pick("(?:Nonce)");
+  const issuedAt = pick("(?:Issued\\s*At|IssuedAt)");
+
+  let chainId = null;
+  if (chainRaw != null) {
+    // erlaubt auch Format eip155:1
+    const num = chainRaw.match(/(\d+)/);
+    if (num) chainId = Number(num[1]);
+  }
+
+  if (!domain || !address || !uri || !version || !chainId || !nonce || !issuedAt) {
+    return null;
+  }
+  return { domain, address, uri, version, chainId, nonce, issuedAt };
 }
 
 // ---- handler ----------------------------------------------------------------
@@ -109,7 +126,6 @@ async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ ok:false, code:"METHOD_NOT_ALLOWED" });
 
   try {
-    // Eingang
     const intent = String(req.headers["x-tc-intent"] || req.headers["X-TC-Intent"] || "");
     const bearer = readBearer(req);
     stage(res, "recv", { intent, hasBearer: !!bearer });
@@ -120,30 +136,32 @@ async function handler(req, res) {
     if (!body || typeof body !== "object") {
       try { body = JSON.parse(req.body || "{}"); } catch { body = {}; }
     }
-    let message = body?.message;           // ← jetzt "let"
+    let message = body?.message;
     const signature = body?.signature;
 
-// ✨ NEU: Message normalisieren (macht aus "\n" echte Zeilenumbrüche)
+    // Message normalisieren (falls als JSON mit "\n" kam)
     if (typeof message === "string") {
       if (message.indexOf("\r\n") !== -1) message = message.replace(/\r\n/g, "\n");
       if (message.indexOf("\\n") !== -1 && message.indexOf("\n") === -1) {
         message = message.replace(/\\n/g, "\n");
       }
-    } 
-
+      message = message.replace(/^\uFEFF/, "");
+    }
     if (!message || !signature) return deny(res, 400, { ok:false, code:"INVALID_PAYLOAD" });
-    
-    stage(res, "parse-body:ok", { msgLen: String(message).length, sigLen: String(signature).length });
 
-    // Nonce (Cookie)
+    stage(res, "parse-body:ok", { msgLen: String(message).length });
+
+    // Nonce
     stage(res, "nonce:get");
     const cookieNonce = getCookie(req, COOKIE_NONCE);
     if (!cookieNonce) return deny(res, 400, { ok:false, code:"MISSING_SERVER_NONCE" });
 
-    // SIWE prüfen
+    // SIWE parse
     stage(res, "siwe:parse");
-    const siwe = parseSiweMessage(message);
+    const siwe = parseSiweMessage(String(message));
     if (!siwe) return deny(res, 400, { ok:false, code:"INVALID_SIWE_FORMAT" });
+
+    // Policy
     if (!ALLOWED_DOMAINS.has(siwe.domain)) return deny(res, 400, { ok:false, code:"DOMAIN_NOT_ALLOWED" });
 
     stage(res, "siwe:uri");
@@ -169,7 +187,7 @@ async function handler(req, res) {
     if (typeof verify !== "function") return deny(res, 500, { ok:false, code:"VERIFY_UNAVAILABLE" });
 
     stage(res, "ethers:verify");
-    const recovered = await verify(message, signature);
+    const recovered = await verify(String(message), String(signature));
     if (!addrEq(recovered, siwe.address)) return deny(res, 401, { ok:false, code:"ADDRESS_MISMATCH" });
 
     // Supabase Admin
@@ -304,7 +322,6 @@ async function handler(req, res) {
     return deny(res, 500, { ok:false, code:"INTERNAL_ERROR" });
   }
 }
-
 
 export default withCors(handler);
 export const config = { runtime: "nodejs" };
