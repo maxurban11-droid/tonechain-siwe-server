@@ -97,34 +97,39 @@ export function corsHeadersForOrigin(origin) {
 
 // WICHTIG: OPTIONS **immer** direkt hier beantworten – ohne Redirects.
 export function withCors(handler) {
-  return async (req, res) => {
+  return async function corsWrapped(req, res) {
     const origin = req.headers.origin || "";
-    const allowed = matchOrigin(origin);
+    // Erlaube Framer + Prod + localhost
+    const allowed =
+      origin.endsWith(".framer.app") ||
+      origin.endsWith(".framer.website") ||
+      origin.includes("tonechain.app") ||
+      origin.startsWith("http://localhost") ||
+      origin.startsWith("http://127.0.0.1");
 
+    res.setHeader("Vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Headers");
+    if (allowed) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Access-Control-Allow-Credentials", "true");
+    }
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      "Content-Type, Authorization, X-TC-Intent, X-TC-Nonce"
+    );
+    // wichtig für die Debug-Header, die du liest:
+    res.setHeader("Access-Control-Expose-Headers", "X-TC-Debug, X-TC-Error, X-TC-CT, X-TC-Nonce-Source");
+
+    // **NIE** Body lesen / parsen. Preflight **sofort** beenden:
     if (req.method === "OPTIONS") {
-      // Auch wenn origin nicht erlaubt ist, neutral mit 204 antworten,
-      // damit der Browser keinen Redirect/CORS-Fehler sieht.
-      setCorsHeaders(res, allowed || origin || "*", req);
-      return res.status(204).end();
+      res.statusCode = 204;
+      return res.end();
     }
 
-    if (req.method === "HEAD") {
-      if (!allowed) return res.status(403).end();
-      setCorsHeaders(res, allowed, req);
-      return res.status(204).end();
-    }
-
-    if (!allowed) {
-      // Bei echten Requests blocken
-      setCorsHeaders(res, null, req);
-      return res.status(403).json({ ok: false, error: "Origin not allowed" });
-    }
-
-    setCorsHeaders(res, allowed, req);
+    // Alle anderen Methoden an den eigentlichen Handler durchreichen
     return handler(req, res);
   };
 }
-
 export function handleOptions(req, res) {
   const origin = req.headers.origin || "";
   const allowed = matchOrigin(origin);
