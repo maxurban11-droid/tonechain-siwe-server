@@ -38,7 +38,11 @@ function clearCookie(res, name) {
   res.setHeader("Set-Cookie", [...(Array.isArray(prev) ? prev : prev ? [String(prev)] : []), del]);
 }
 function deny(res, status, body) {
-  try { clearCookie(res, COOKIE_SESSION); clearCookie(res, COOKIE_NONCE); } catch {}
+  try {
+    // Nur Session aufräumen – die Nonce bleibt bestehen,
+    // damit ein erneuter Versuch funktionieren kann.
+    clearCookie(res, COOKIE_SESSION);
+  } catch {}
   return res.status(status).json(body);
 }
 function getCookie(req, name) {
