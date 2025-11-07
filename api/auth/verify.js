@@ -104,6 +104,7 @@ function parseSiweMessage(msg) {
 
 // ---- handler ----------------------------------------------------------------
 async function handler(req, res) {
+  res.setHeader("Access-Control-Expose-Headers", "X-TC-Debug, X-TC-Error");
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "POST") return res.status(405).json({ ok:false, code:"METHOD_NOT_ALLOWED" });
 
@@ -119,12 +120,19 @@ async function handler(req, res) {
     if (!body || typeof body !== "object") {
       try { body = JSON.parse(req.body || "{}"); } catch { body = {}; }
     }
-    const message = body?.message;
+    let message = body?.message;           // ← jetzt "let"
     const signature = body?.signature;
-    if (!message || !signature) {
-      stage(res, "parse-body:invalid");
-      return deny(res, 400, { ok:false, code:"INVALID_PAYLOAD" });
+
+// ✨ NEU: Message normalisieren (macht aus "\n" echte Zeilenumbrüche)
+    if (typeof message === "string") {
+      if (message.indexOf("\r\n") !== -1) message = message.replace(/\r\n/g, "\n");
+      if (message.indexOf("\\n") !== -1 && message.indexOf("\n") === -1) {
+        message = message.replace(/\\n/g, "\n");
+      }
     }
+
+    if (!message || !signature) return deny(res, 400, { ok:false, code:"INVALID_PAYLOAD" });
+    
     stage(res, "parse-body:ok", { msgLen: String(message).length, sigLen: String(signature).length });
 
     // Nonce (Cookie)
