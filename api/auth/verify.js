@@ -224,50 +224,58 @@ if (intent === "link") {
     return deny(res, 403, { ok:false, code:"LINK_REQUIRES_VALID_BEARER" });
   }
 
-  // 1) Aktuellen Besitzstand lesen
-  const { data: existing, error: exErr } = await sbAdmin
+  // 1) aktueller Besitzstand
+const { data: existing, error: exErr } = await sbAdmin
+  .from("wallets")
+  .select("user_id")
+  .eq("address", addressLower)
+  .maybeSingle();
+if (exErr) return deny(res, 500, { ok:false, code:"DB_SELECT_ERROR" });
+
+// a) Gehört bereits jemand anderem → sofort blocken
+if (existing?.user_id && existing.user_id !== emailProfileId) {
+  return deny(res, 409, {
+    ok:false,
+    code:"WALLET_ALREADY_LINKED",
+    message:"This wallet is already linked to another profile."
+  });
+}
+
+// 2) Atomisch claimen: nur wenn noch unassigned
+const { data: upd, error: updErr } = await sbAdmin
+  .from("wallets")
+  .update({ user_id: emailProfileId })
+  .eq("address", addressLower)
+  .is("user_id", null)
+  .select("user_id")
+  .maybeSingle();
+
+if (updErr) {
+  return deny(res, 500, { ok:false, code:"LINK_ERROR" });
+}
+
+// 3) Nichts geändert? -> Race prüfen & sauber antworten
+if (!upd) {
+  const { data: again } = await sbAdmin
     .from("wallets")
-    .select("address,user_id")
+    .select("user_id")
     .eq("address", addressLower)
     .maybeSingle();
-  if (exErr) return deny(res, 500, { ok:false, code:"DB_SELECT_ERROR" });
 
-  // a) Wallet gehört schon jemand anderem -> sofort abbrechen
-  if (existing?.user_id && existing.user_id !== emailProfileId) {
+  if (!again?.user_id) {
+    return deny(res, 409, { ok:false, code:"LINK_RACE_CONFLICT" });
+  }
+  if (again.user_id !== emailProfileId) {
     return deny(res, 409, {
-      ok:false,
-      code:"WALLET_ALREADY_LINKED",
+      ok:false, code:"WALLET_ALREADY_LINKED",
       message:"This wallet is already linked to another profile."
     });
   }
+}
 
-  // 2) Nur „claimen“, wenn noch frei (user_id IS NULL). Keine Fremdüberschreibung möglich.
-  //    Falls die Row noch nicht existiert: erst Address-Row sicherstellen.
-  if (!existing) {
-    const { error: insErr } = await sbAdmin
-      .from("wallets")
-      .insert({ address: addressLower })  // user_id absichtlich noch nicht setzen
-    if (insErr && String(insErr.code) !== "23505") {
-      return deny(res, 500, { ok:false, code:"LINK_ERROR" });
-    }
-  }
-  const { data: upd, error: linkErr } = await sbAdmin
-    .from("wallets")
-    .update({ user_id: emailProfileId })
-    .eq("address", addressLower)
-    .is("user_id", null)
-    .select("user_id");
-  if (linkErr) return deny(res, 500, { ok:false, code:"LINK_ERROR" });
-  // Konnte nicht gesetzt werden -> entweder schon mir gehörend, oder fremd (oben geprüft)
-  const finalUserId = (upd && upd[0]?.user_id) || existing?.user_id || null;
-  if (!finalUserId) {
-    return deny(res, 409, { ok:false, code:"LINK_RACE_CONFLICT" });
-  }
-  if (finalUserId !== emailProfileId) {
-    return deny(res, 409, { ok:false, code:"WALLET_ALREADY_LINKED" });
-  }
-  isRegistered = true;
-  walletUserId = emailProfileId;
+// Erfolg
+isRegistered = true;
+walletUserId = emailProfileId;
 }
 
     // NORMALER SIGN-IN (kein Link)
