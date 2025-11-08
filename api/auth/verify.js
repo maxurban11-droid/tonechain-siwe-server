@@ -217,50 +217,39 @@ async function handler(req, res) {
       }
     }
 
-    // LINK
+   // ---- LINK: Wallet mit aktiver E-Mail-Session verknüpfen (sicher, ohne Upsert)
 if (intent === "link") {
-  stage(res, "link:begin");
+  stage(res, "link:begin", { hasBearer: !!bearer });
+  if (!bearer) return deny(res, 403, { ok:false, code:"LINK_REQUIRES_VALID_BEARER" });
 
-  // 0) E-Mail-Session muss gültig sein
-  if (!bearer) {
-    return deny(res, 403, { ok:false, code:"LINK_REQUIRES_VALID_BEARER" });
-  }
-
-  // 1) Aktuellen Auth-User & sein Profile ermitteln/erzeugen
+  // 1) Aktuellen Benutzer & zugehöriges Profil ermitteln
   let emailProfileId = null;
   try {
     const { data: authData, error: authErr } = await sbAdmin.auth.getUser(bearer);
-    if (authErr) {
-      return deny(res, 403, { ok:false, code:"LINK_REQUIRES_VALID_BEARER" });
-    }
+    if (authErr) return deny(res, 403, { ok:false, code:"LINK_REQUIRES_VALID_BEARER" });
     const authUserId = authData?.user?.id || null;
-    if (!authUserId) {
-      return deny(res, 403, { ok:false, code:"LINK_REQUIRES_VALID_BEARER" });
-    }
+    if (!authUserId) return deny(res, 403, { ok:false, code:"LINK_REQUIRES_VALID_BEARER" });
 
-    // bestehendes Profil?
-    const { data: profExisting } = await sbAdmin
+    const { data: prof } = await sbAdmin
       .from("profiles")
       .select("id")
       .eq("user_id", authUserId)
       .maybeSingle();
 
-    if (profExisting?.id) {
-      emailProfileId = profExisting.id;
+    // Falls der Nutzer noch kein Profile hat, eines anlegen (idempotent)
+    if (prof?.id) {
+      emailProfileId = prof.id;
     } else {
-      // minimal anlegen (creator_name optional)
-      const { data: profNew, error: pErr } = await sbAdmin
+      const { data: created, error: pErr } = await sbAdmin
         .from("profiles")
         .insert({ user_id: authUserId })
         .select("id")
         .single();
-      if (pErr) {
-        return deny(res, 500, { ok:false, code:"PROFILE_CREATE_ERROR" });
-      }
-      emailProfileId = profNew.id;
+      if (pErr) return deny(res, 500, { ok:false, code:"PROFILE_CREATE_ERROR" });
+      emailProfileId = created.id;
     }
   } catch {
-    return deny(res, 403, { ok:false, code:"LINK_REQUIRES_VALID_BEARER" });
+    return deny(res, 500, { ok:false, code:"PROFILE_RESOLVE_ERROR" });
   }
 
   // 2) Besitzstand der Wallet lesen
@@ -271,7 +260,7 @@ if (intent === "link") {
     .maybeSingle();
   if (exErr) return deny(res, 500, { ok:false, code:"DB_SELECT_ERROR" });
 
-  // 2a) Wallet gehört schon jemand anderem → blocken
+  // a) gehört bereits jemand anderem? → sofort 409
   if (existing?.user_id && existing.user_id !== emailProfileId) {
     return deny(res, 409, {
       ok:false,
@@ -280,21 +269,17 @@ if (intent === "link") {
     });
   }
 
-  // 3) Atomisch claimen: nur wenn (noch) frei
-  const { data: upd, error: updErr } = await sbAdmin
+  // 3) Atomar „claimen“: nur wenn (noch) unassigned
+  const { data: upd, error: linkErr } = await sbAdmin
     .from("wallets")
     .update({ user_id: emailProfileId })
     .eq("address", addressLower)
     .is("user_id", null)
-    .select("user_id")
-    .maybeSingle();
+    .select("user_id");
+  if (linkErr) return deny(res, 500, { ok:false, code:"LINK_ERROR" });
 
-  if (updErr) {
-    return deny(res, 500, { ok:false, code:"LINK_ERROR" });
-  }
-
-  // 4) Nichts geändert? → Race prüfen
-  if (!upd) {
+  if (!upd || upd.length === 0) {
+    // Lost race: nochmal lesen und bewerten
     const { data: again } = await sbAdmin
       .from("wallets")
       .select("user_id")
@@ -302,21 +287,35 @@ if (intent === "link") {
       .maybeSingle();
 
     if (!again?.user_id) {
+      // immer noch nicht verknüpft → Race/Retry dem Client melden
       return deny(res, 409, { ok:false, code:"LINK_RACE_CONFLICT" });
     }
     if (again.user_id !== emailProfileId) {
+      // wurde in der Zwischenzeit von jemand anders belegt → blocken
       return deny(res, 409, {
-        ok:false, code:"WALLET_ALREADY_LINKED",
+        ok:false,
+        code:"WALLET_ALREADY_LINKED",
         message:"This wallet is already linked to another profile."
       });
     }
+    walletUserId = again.user_id;
+  } else {
+    walletUserId = upd[0]?.user_id ?? emailProfileId;
   }
 
-  // Erfolg → setze Session wie gehabt
   isRegistered = true;
-  walletUserId = emailProfileId;
-}
+  // Session setzen wie gehabt …
+  stage(res, "session:set");
+  const payload = { v:1, addr: addressLower, userId: walletUserId, ts: Date.now(), exp: Date.now() + SESSION_TTL_SEC * 1000 };
+  const raw = JSON.stringify(payload);
+  const sig = sign(raw);
+  const sessionValue = Buffer.from(JSON.stringify(sig ? { raw, sig } : { raw })).toString("base64");
+  clearCookie(res, COOKIE_NONCE);
+  setCookie(res, COOKIE_SESSION, sessionValue, { maxAgeSec: SESSION_TTL_SEC });
 
+  stage(res, "ok");
+  return res.status(200).json({ ok:true, address: addressLower, userId: walletUserId, linked: true });
+}
     // NORMALER SIGN-IN (kein Link)
     if (intent !== "link") {
       stage(res, "normal:gate", { isRegistered, walletUserId, emailProfileId: !!emailProfileId });
