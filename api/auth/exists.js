@@ -109,10 +109,22 @@ export default async function handler(req, res) {
       return res.status(500).json({ ok: false, code: "DB_ERROR", message: error.message });
     }
 
-    const exists = !!w;
-    const linkedToAny = !!w?.user_id;
-    const linkedToMe = !!(linkedToAny && myProfileId && w.user_id === myProfileId);
-    const linkedToOther = !!(linkedToAny && myProfileId && w.user_id !== myProfileId);
+    // ... nach dem Wallet-Select:
+const exists = !!w;
+let linkedToMe = false;
+let linkedToOther = false;
+
+if (exists) {
+  if (myProfileId) {
+    linkedToMe = w?.user_id === myProfileId;
+    linkedToOther = !!w?.user_id && w.user_id !== myProfileId;
+  } else {
+    linkedToMe = false;
+    linkedToOther = !!w?.user_id; // ohne Bearer: jede Zuordnung ist "Other"
+  }
+}
+
+const body = { ok:true, exists, linkedToMe, linkedToOther };
 
     // Nutzerbezogene Antwort → nicht cachen
     res.setHeader("Cache-Control", "no-store");
