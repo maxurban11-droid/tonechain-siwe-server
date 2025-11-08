@@ -3,6 +3,8 @@
 
 import crypto from "node:crypto";
 import { withCors } from "../../helpers/cors.js";
+import { createClient } from "@supabase/supabase-js"
+import type { NextApiRequest, NextApiResponse } from "next"
 
 const ALLOWED_DOMAINS = new Set(["tonechain.app", "concave-device-193297.framer.app"]);
 const ALLOWED_URI_PREFIXES = [
@@ -17,6 +19,10 @@ const COOKIE_NONCE = "tc_nonce";
 const COOKIE_SESSION = "tc_session";
 const SESSION_TTL_SEC = 60 * 60 * 24;
 const SESSION_SECRET = process.env.SESSION_SECRET || null;
+const supaAdmin = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY! // Service-Role erforderlich
+)
 
 // ---- Debug helpers ----------------------------------------------------------
 const DEBUG_SIWE = process.env.DEBUG_SIWE === "1";
@@ -222,66 +228,112 @@ async function handler(req, res) {
     }
 
     // LINK
-    if (intent === "link") {
-      stage(res, "link:begin", { hasBearer: !!bearer, emailProfileId: !!emailProfileId });
-      if (!bearer || !emailProfileId) return deny(res, 403, { ok:false, code:"LINK_REQUIRES_VALID_BEARER" });
+if (intent === "link") {
+  stage(res, "link:begin", { hasBearer: !!bearer, emailProfileId: !!emailProfileId });
+  if (!bearer || !emailProfileId) {
+    return deny(res, 403, { ok:false, code:"LINK_REQUIRES_VALID_BEARER" });
+  }
 
-      if (walletUserId && walletUserId !== emailProfileId) {
-        return deny(res, 409, { ok:false, code:"WALLET_ALREADY_LINKED", message:"This wallet is already linked to another profile." });
-      }
+  // Wallet gehört bereits jemand anderem → hart ablehnen
+  if (walletUserId && walletUserId !== emailProfileId) {
+    return deny(res, 409, {
+      ok:false,
+      code:"WALLET_ALREADY_LINKED",
+      message:"This wallet is already linked to another profile."
+    });
+  }
 
-      if (!isRegistered) {
-        const { error: insErr } = await sbAdmin.from("wallets").insert({ address: addressLower, user_id: emailProfileId });
-        if (insErr) {
-          const { data: again } = await sbAdmin.from("wallets").select("address,user_id").eq("address", addressLower).maybeSingle();
-          const uid = again?.user_id ?? null;
-          if (uid && uid !== emailProfileId) return deny(res, 409, { ok:false, code:"WALLET_ALREADY_LINKED", message:"This wallet is already linked to another profile." });
-          if (!uid) return deny(res, 500, { ok:false, code:"DB_UPSERT_ERROR" });
-        }
-        isRegistered = true;
-        walletUserId = emailProfileId;
-      } else if (!walletUserId) {
-        const { data: upd, error: linkErr } = await sbAdmin
-          .from("wallets").update({ user_id: emailProfileId })
-          .eq("address", addressLower).is("user_id", null).select("user_id");
-        if (linkErr) return deny(res, 500, { ok:false, code:"LINK_ERROR" });
-        if (!upd || upd.length === 0) {
-          const { data: again } = await sbAdmin.from("wallets").select("address,user_id").eq("address", addressLower).maybeSingle();
-          const uid = again?.user_id ?? null;
-          if (uid && uid !== emailProfileId) return deny(res, 409, { ok:false, code:"WALLET_ALREADY_LINKED", message:"This wallet is already linked to another profile." });
-          if (!uid) return deny(res, 500, { ok:false, code:"LINK_ERROR" });
-        }
-        walletUserId = emailProfileId;
+  // Wallet-Record anlegen, wenn nicht vorhanden
+  if (!isRegistered) {
+    const { error: insErr } = await sbAdmin
+      .from("wallets")
+      .insert({ address: addressLower, user_id: emailProfileId });
+
+    if (insErr) {
+      // Race-Condition abfangen: nochmal lesen und vergleichen
+      const { data: again } = await sbAdmin
+        .from("wallets")
+        .select("address,user_id")
+        .eq("address", addressLower)
+        .maybeSingle();
+
+      const uid = again?.user_id ?? null;
+      if (uid && uid !== emailProfileId) {
+        return deny(res, 409, {
+          ok:false,
+          code:"WALLET_ALREADY_LINKED",
+          message:"This wallet is already linked to another profile."
+        });
       }
+      if (!uid) return deny(res, 500, { ok:false, code:"DB_UPSERT_ERROR" });
     }
 
-    // NORMAL
-    if (intent !== "link") {
-      stage(res, "normal:gate", { isRegistered, walletUserId, emailProfileId: !!emailProfileId });
-      if (!isRegistered) return deny(res, 403, { ok:false, code:"WALLET_NOT_REGISTERED", message:"No account found for this wallet. Please sign up or link first." });
-      if (!walletUserId) return deny(res, 409, { ok:false, code:"WALLET_UNASSIGNED", message:"This wallet is not linked to any profile yet. Use Link mode." });
-      if (emailProfileId && walletUserId !== emailProfileId) {
-        return deny(res, 409, { ok:false, code:"OTHER_ACCOUNT_ACTIVE", message:"Another account is active via email. Use Link mode." });
+    isRegistered = true;
+    walletUserId = emailProfileId;
+  }
+  // Wallet-Datensatz existiert bereits, aber ohne Zuweisung → nur dann auf **mein** Profil setzen
+  else if (!walletUserId) {
+    const { data: upd, error: linkErr } = await sbAdmin
+      .from("wallets")
+      .update({ user_id: emailProfileId })
+      .eq("address", addressLower)
+      .is("user_id", null)           // <- schützt gegen Überschreiben fremder Links
+      .select("user_id");
+
+    if (linkErr) return deny(res, 500, { ok:false, code:"LINK_ERROR" });
+
+    if (!upd || upd.length === 0) {
+      // Nochmals prüfen, ob jemand anderes in der Zwischenzeit verlinkt hat
+      const { data: again } = await sbAdmin
+        .from("wallets")
+        .select("address,user_id")
+        .eq("address", addressLower)
+        .maybeSingle();
+
+      const uid = again?.user_id ?? null;
+      if (uid && uid !== emailProfileId) {
+        return deny(res, 409, {
+          ok:false,
+          code:"WALLET_ALREADY_LINKED",
+          message:"This wallet is already linked to another profile."
+        });
       }
+      if (!uid) return deny(res, 500, { ok:false, code:"LINK_ERROR" });
     }
 
-    // Session
-    stage(res, "session:set");
-    const payload = { v: 1, addr: addressLower, userId: walletUserId, ts: Date.now(), exp: Date.now() + SESSION_TTL_SEC * 1000 };
-    const raw = JSON.stringify(payload);
-    const sig = sign(raw);
-    const sessionValue = Buffer.from(JSON.stringify(sig ? { raw, sig } : { raw })).toString("base64");
+    walletUserId = emailProfileId;
+  }
+}
 
-    clearCookie(res, COOKIE_NONCE);
-    setCookie(res, COOKIE_SESSION, sessionValue, { maxAgeSec: SESSION_TTL_SEC });
+    // NORMAL (signin/signup – ohne Link)
+if (intent !== "link") {
+  stage(res, "normal:gate", { isRegistered, walletUserId, emailProfileId: !!emailProfileId });
 
-    stage(res, "ok");
-    return res.status(200).json({ ok:true, address: addressLower, userId: walletUserId, linked: intent === "link" });
-  } catch (e) {
-    console.error("[SIWE verify] unexpected error:", e);
-    stage(res, "unexpected");
-    errHdr(res, e);
-    return deny(res, 500, { ok:false, code:"INTERNAL_ERROR" });
+  // Wallet existiert noch nicht → kein Login möglich
+  if (!isRegistered) {
+    return deny(res, 403, {
+      ok:false,
+      code:"WALLET_NOT_REGISTERED",
+      message:"No account found for this wallet. Please sign up or link first."
+    });
+  }
+
+  // Wallet hat noch kein user_id → erst im Link-Modus zuweisen
+  if (!walletUserId) {
+    return deny(res, 409, {
+      ok:false,
+      code:"WALLET_UNASSIGNED",
+      message:"This wallet is not linked to any profile yet. Use Link mode."
+    });
+  }
+
+  // Es existiert eine aktive E-Mail-Session, aber sie gehört zu einem anderen Profil
+  if (emailProfileId && walletUserId !== emailProfileId) {
+    return deny(res, 409, {
+      ok:false,
+      code:"OTHER_ACCOUNT_ACTIVE",
+      message:"Another account is active via email. Use Link mode."
+    });
   }
 }
 
