@@ -3,15 +3,13 @@
 
 import crypto from "node:crypto";
 import { withCors } from "../../helpers/cors.js";
-import { createClient } from "@supabase/supabase-js"
-import type { NextApiRequest, NextApiResponse } from "next"
 
 const ALLOWED_DOMAINS = new Set(["tonechain.app", "concave-device-193297.framer.app"]);
 const ALLOWED_URI_PREFIXES = [
   "https://tonechain.app",
   "https://concave-device-193297.framer.app",
 ];
-const ALLOWED_CHAINS = new Set([1, 11155111]);
+const ALLOWED_CHAINS = new Set([1, 11155111]); // mainnet + sepolia
 const MAX_AGE_MIN = 10;
 const MAX_SKEW_MS = 5 * 60 * 1000;
 
@@ -19,10 +17,6 @@ const COOKIE_NONCE = "tc_nonce";
 const COOKIE_SESSION = "tc_session";
 const SESSION_TTL_SEC = 60 * 60 * 24;
 const SESSION_SECRET = process.env.SESSION_SECRET || null;
-const supaAdmin = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY! // Service-Role erforderlich
-)
 
 // ---- Debug helpers ----------------------------------------------------------
 const DEBUG_SIWE = process.env.DEBUG_SIWE === "1";
@@ -111,7 +105,7 @@ function parseSiweMessage(input) {
   return { domain, address, uri, version, chainId, nonce, issuedAt };
 }
 
-// --------- NEU: raw JSON Body reader (um req.body Getter zu vermeiden) -------
+// --------- RAW-Body reader (kritisch: NICHT req.body verwenden) --------------
 async function readJsonBody(req) {
   try {
     let raw = "";
@@ -127,7 +121,8 @@ async function readJsonBody(req) {
 
 // ---- handler ----------------------------------------------------------------
 async function handler(req, res) {
-  res.setHeader("Access-Control-Expose-Headers", "X-TC-Debug, X-TC-Error, X-TC-CT");
+  // ⚠️ Nichts Teures vor dem OPTIONS-Return!
+  res.setHeader("Access-Control-Expose-Headers", "X-TC-Debug, X-TC-Error, X-TC-CT, X-TC-Nonce-Source");
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "POST") return res.status(405).json({ ok:false, code:"METHOD_NOT_ALLOWED" });
 
@@ -135,9 +130,9 @@ async function handler(req, res) {
     const intent = String(req.headers["x-tc-intent"] || req.headers["X-TC-Intent"] || "");
     const bearer = readBearer(req);
     stage(res, "recv", { intent, hasBearer: !!bearer });
-    setHdr(res, "X-TC-CT", String(req.headers["content-type"] || "")); // debug: eingehender content-type
+    setHdr(res, "X-TC-CT", String(req.headers["content-type"] || "")); // debug
 
-    // Body robust einlesen (nicht req.body verwenden!)
+    // Body robust einlesen
     stage(res, "parse-body:raw");
     const body = await readJsonBody(req);
     let message = body?.message;
@@ -156,14 +151,10 @@ async function handler(req, res) {
     const cookieNonce = getCookie(req, COOKIE_NONCE);
     const headerNonce = (req.headers["x-tc-nonce"] ? String(req.headers["x-tc-nonce"]) : "").trim() || null;
     const serverNonce = cookieNonce || headerNonce;
-
     setHdr(res, "X-TC-Nonce-Source", cookieNonce ? "cookie" : (headerNonce ? "header" : "none"));
+    if (!serverNonce) return deny(res, 400, { ok:false, code:"MISSING_SERVER_NONCE" });
 
-    if (!serverNonce) {
-      return deny(res, 400, { ok:false, code:"MISSING_SERVER_NONCE" });
-    }
-
-    // SIWE
+    // SIWE-Grundvalidierung
     stage(res, "siwe:parse");
     const siwe = parseSiweMessage(String(message));
     if (!siwe) return deny(res, 400, { ok:false, code:"INVALID_SIWE_FORMAT" });
@@ -176,9 +167,8 @@ async function handler(req, res) {
     } catch { return deny(res, 400, { ok:false, code:"URI_NOT_ALLOWED" }); }
     if (!ALLOWED_CHAINS.has(Number(siwe.chainId))) return deny(res, 400, { ok:false, code:"CHAIN_NOT_ALLOWED" });
     if (!withinAge(siwe.issuedAt)) return deny(res, 400, { ok:false, code:"MESSAGE_TOO_OLD" });
-    if (siwe.nonce !== serverNonce) {
-      return deny(res, 401, { ok:false, code:"NONCE_MISMATCH" });
-    }
+    if (siwe.nonce !== serverNonce) return deny(res, 401, { ok:false, code:"NONCE_MISMATCH" });
+
     // Signatur prüfen
     stage(res, "ethers:import");
     const ethersMod = await import("ethers");
@@ -227,115 +217,76 @@ async function handler(req, res) {
       }
     }
 
-    // LINK
-if (intent === "link") {
-  stage(res, "link:begin", { hasBearer: !!bearer, emailProfileId: !!emailProfileId });
-  if (!bearer || !emailProfileId) {
-    return deny(res, 403, { ok:false, code:"LINK_REQUIRES_VALID_BEARER" });
-  }
-
-  // Wallet gehört bereits jemand anderem → hart ablehnen
-  if (walletUserId && walletUserId !== emailProfileId) {
-    return deny(res, 409, {
-      ok:false,
-      code:"WALLET_ALREADY_LINKED",
-      message:"This wallet is already linked to another profile."
-    });
-  }
-
-  // Wallet-Record anlegen, wenn nicht vorhanden
-  if (!isRegistered) {
-    const { error: insErr } = await sbAdmin
-      .from("wallets")
-      .insert({ address: addressLower, user_id: emailProfileId });
-
-    if (insErr) {
-      // Race-Condition abfangen: nochmal lesen und vergleichen
-      const { data: again } = await sbAdmin
-        .from("wallets")
-        .select("address,user_id")
-        .eq("address", addressLower)
-        .maybeSingle();
-
-      const uid = again?.user_id ?? null;
-      if (uid && uid !== emailProfileId) {
-        return deny(res, 409, {
-          ok:false,
-          code:"WALLET_ALREADY_LINKED",
-          message:"This wallet is already linked to another profile."
-        });
+    // LINK-MODUS: nur wenn X-TC-Intent: link
+    if (intent === "link") {
+      stage(res, "link:begin", { hasBearer: !!bearer, emailProfileId: !!emailProfileId });
+      if (!bearer || !emailProfileId) {
+        return deny(res, 403, { ok:false, code:"LINK_REQUIRES_VALID_BEARER" });
       }
-      if (!uid) return deny(res, 500, { ok:false, code:"DB_UPSERT_ERROR" });
+
+      // Wallet gehört schon jemand anderem → blocken
+      if (walletUserId && walletUserId !== emailProfileId) {
+        return deny(res, 409, { ok:false, code:"WALLET_ALREADY_LINKED", message:"This wallet is already linked to another profile." });
+      }
+
+      if (!isRegistered) {
+        // neu registrieren & dem aktuellen Profil zuordnen
+        const { error: insErr } = await sbAdmin.from("wallets").insert({ address: addressLower, user_id: emailProfileId });
+        if (insErr) {
+          // race-condition sauber auflösen
+          const { data: again } = await sbAdmin.from("wallets").select("address,user_id").eq("address", addressLower).maybeSingle();
+          const uid = again?.user_id ?? null;
+          if (uid && uid !== emailProfileId) return deny(res, 409, { ok:false, code:"WALLET_ALREADY_LINKED", message:"This wallet is already linked to another profile." });
+          if (!uid) return deny(res, 500, { ok:false, code:"DB_UPSERT_ERROR" });
+        }
+        isRegistered = true;
+        walletUserId = emailProfileId;
+      } else if (!walletUserId) {
+        // vorhandener Datensatz ohne user → auf mein Profil setzen (optimistisch mit WHERE user_id IS NULL)
+        const { data: upd, error: linkErr } = await sbAdmin
+          .from("wallets").update({ user_id: emailProfileId })
+          .eq("address", addressLower).is("user_id", null).select("user_id");
+        if (linkErr) return deny(res, 500, { ok:false, code:"LINK_ERROR" });
+        if (!upd || upd.length === 0) {
+          const { data: again } = await sbAdmin.from("wallets").select("address,user_id").eq("address", addressLower).maybeSingle();
+          const uid = again?.user_id ?? null;
+          if (uid && uid !== emailProfileId) return deny(res, 409, { ok:false, code:"WALLET_ALREADY_LINKED", message:"This wallet is already linked to another profile." });
+          if (!uid) return deny(res, 500, { ok:false, code:"LINK_ERROR" });
+        }
+        walletUserId = emailProfileId;
+      }
     }
 
-    isRegistered = true;
-    walletUserId = emailProfileId;
-  }
-  // Wallet-Datensatz existiert bereits, aber ohne Zuweisung → nur dann auf **mein** Profil setzen
-  else if (!walletUserId) {
-    const { data: upd, error: linkErr } = await sbAdmin
-      .from("wallets")
-      .update({ user_id: emailProfileId })
-      .eq("address", addressLower)
-      .is("user_id", null)           // <- schützt gegen Überschreiben fremder Links
-      .select("user_id");
-
-    if (linkErr) return deny(res, 500, { ok:false, code:"LINK_ERROR" });
-
-    if (!upd || upd.length === 0) {
-      // Nochmals prüfen, ob jemand anderes in der Zwischenzeit verlinkt hat
-      const { data: again } = await sbAdmin
-        .from("wallets")
-        .select("address,user_id")
-        .eq("address", addressLower)
-        .maybeSingle();
-
-      const uid = again?.user_id ?? null;
-      if (uid && uid !== emailProfileId) {
-        return deny(res, 409, {
-          ok:false,
-          code:"WALLET_ALREADY_LINKED",
-          message:"This wallet is already linked to another profile."
-        });
+    // NORMALER SIGN-IN (kein Link)
+    if (intent !== "link") {
+      stage(res, "normal:gate", { isRegistered, walletUserId, emailProfileId: !!emailProfileId });
+      if (!isRegistered) return deny(res, 403, { ok:false, code:"WALLET_NOT_REGISTERED", message:"No account found for this wallet. Please sign up or link first." });
+      if (!walletUserId) return deny(res, 409, { ok:false, code:"WALLET_UNASSIGNED", message:"This wallet is not linked to any profile yet. Use Link mode." });
+      if (emailProfileId && walletUserId !== emailProfileId) {
+        return deny(res, 409, { ok:false, code:"OTHER_ACCOUNT_ACTIVE", message:"Another account is active via email. Use Link mode." });
       }
-      if (!uid) return deny(res, 500, { ok:false, code:"LINK_ERROR" });
     }
 
-    walletUserId = emailProfileId;
+    // Session setzen
+    stage(res, "session:set");
+    const payload = { v: 1, addr: addressLower, userId: walletUserId, ts: Date.now(), exp: Date.now() + SESSION_TTL_SEC * 1000 };
+    const raw = JSON.stringify(payload);
+    const sig = sign(raw);
+    const sessionValue = Buffer.from(JSON.stringify(sig ? { raw, sig } : { raw })).toString("base64");
+
+    clearCookie(res, COOKIE_NONCE);
+    setCookie(res, COOKIE_SESSION, sessionValue, { maxAgeSec: SESSION_TTL_SEC });
+
+    stage(res, "ok");
+    return res.status(200).json({ ok:true, address: addressLower, userId: walletUserId, linked: intent === "link" });
+  } catch (e) {
+    console.error("[SIWE verify] unexpected error:", e);
+    stage(res, "unexpected");
+    errHdr(res, e);
+    return deny(res, 500, { ok:false, code:"INTERNAL_ERROR" });
   }
 }
 
-    // NORMAL (signin/signup – ohne Link)
-if (intent !== "link") {
-  stage(res, "normal:gate", { isRegistered, walletUserId, emailProfileId: !!emailProfileId });
-
-  // Wallet existiert noch nicht → kein Login möglich
-  if (!isRegistered) {
-    return deny(res, 403, {
-      ok:false,
-      code:"WALLET_NOT_REGISTERED",
-      message:"No account found for this wallet. Please sign up or link first."
-    });
-  }
-
-  // Wallet hat noch kein user_id → erst im Link-Modus zuweisen
-  if (!walletUserId) {
-    return deny(res, 409, {
-      ok:false,
-      code:"WALLET_UNASSIGNED",
-      message:"This wallet is not linked to any profile yet. Use Link mode."
-    });
-  }
-
-  // Es existiert eine aktive E-Mail-Session, aber sie gehört zu einem anderen Profil
-  if (emailProfileId && walletUserId !== emailProfileId) {
-    return deny(res, 409, {
-      ok:false,
-      code:"OTHER_ACCOUNT_ACTIVE",
-      message:"Another account is active via email. Use Link mode."
-    });
-  }
-}
-
+// ⬅️ GANZ WICHTIG:
 export default withCors(handler);
 export const config = { runtime: "nodejs" };
