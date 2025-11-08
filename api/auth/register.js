@@ -2,6 +2,7 @@
 // SIWE "register/signup" + "link" – robustes CORS, raw-body, Debug-Stages, Node runtime.
 
 import { withCors } from "../../helpers/cors.js";
+import { createClient } from '@supabase/supabase-js'
 
 /* ---------- Policy ---------- */
 const ALLOWED_DOMAINS = new Set(["tonechain.app", "concave-device-193297.framer.app"]);
@@ -109,7 +110,6 @@ async function handler(req, res) {
     const creatorName = (body?.creatorName ?? "").toString().trim();
 
     if (typeof message === "string") {
-      // JSON-escaped \n → echte Zeilenumbrüche
       if (message.indexOf("\\n") !== -1 && message.indexOf("\n") === -1) message = message.replace(/\\n/g, "\n");
       message = message.replace(/\r\n/g, "\n").replace(/^\uFEFF/, "");
     }
@@ -120,7 +120,7 @@ async function handler(req, res) {
       return res.status(400).json({ ok:false, code:"CREATOR_NAME_REQUIRED", message:"Creator name is required for signup" });
     }
 
-    // Nonce: Cookie bevorzugt, sonst Header (Debug-Header setzen)
+    // Nonce
     stage(res, "nonce:get");
     const cookieNonce = getCookie(req, COOKIE_NONCE);
     const headerNonce = (req.headers["x-tc-nonce"] ? String(req.headers["x-tc-nonce"]) : "").trim() || null;
@@ -143,7 +143,7 @@ async function handler(req, res) {
     if (!withinAge(siwe.issuedAt)) return res.status(400).json({ ok: false, code: "MESSAGE_TOO_OLD" });
     if (siwe.nonce !== serverNonce) return res.status(401).json({ ok: false, code: "NONCE_MISMATCH" });
 
-    // Signatur prüfen (Node runtime erforderlich)
+    // Signatur prüfen
     stage(res, "ethers:verify");
     const ethersMod = await import("ethers");
     const verify =
@@ -266,7 +266,6 @@ async function handler(req, res) {
     if (intent !== "link") {
       stage(res, "signup:begin");
       if (profileId) {
-        // Bereits registriert → idempotent erfolgreich
         setHdr(res, "Cache-Control", "no-store");
         return res.status(200).json({
           ok: true,
@@ -304,7 +303,8 @@ async function handler(req, res) {
       }
       if (!upd || upd.length === 0) {
         // Lost race → neu erzeugtes Profil aufräumen
-        await sb.from("profiles").delete().eq("id", prof.id).catch(() => {});
+        // FIX: QueryBuilder nicht mit .catch ketten – in try/catch kapseln
+        try { await sb.from("profiles").delete().eq("id", prof.id); } catch {}
         const { data: again } = await sb.from("wallets").select("user_id").eq("address", addressLower).maybeSingle();
         if (!again?.user_id) {
           return res.status(409).json({ ok: false, code: "SIGNUP_RACE_CONFLICT" });
@@ -315,9 +315,19 @@ async function handler(req, res) {
       }
     }
 
-    // Optional: Creator-Name nachtragen, falls vorhanden
-    if (creatorName && (profileId)) {
-      await sb.from("profiles").update({ creator_name: creatorName }).eq("id", profileId).catch(() => {});
+    // Optional: Creator-Name nachtragen
+    if (creatorName && profileId) {
+      // FIX: kein .catch an Builder; sauber awaiten + Fehler nur loggen
+      try {
+        const { error: updErr } = await sb
+          .from("profiles")
+          .update({ creator_name: creatorName })
+          .eq("id", profileId)
+          .select("id"); // force request
+        if (updErr) console.warn("[register] optional set creator_name failed:", updErr);
+      } catch (e) {
+        console.warn("[register] optional set creator_name exception:", e?.message || e);
+      }
     }
 
     setHdr(res, "Cache-Control", "no-store");
