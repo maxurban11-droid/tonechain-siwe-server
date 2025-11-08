@@ -217,50 +217,22 @@ async function handler(req, res) {
       }
     }
 
-   // ---- LINK: Wallet mit aktiver E-Mail-Session verknüpfen (sicher, ohne Upsert)
+    // LINK
 if (intent === "link") {
-  stage(res, "link:begin", { hasBearer: !!bearer });
-  if (!bearer) return deny(res, 403, { ok:false, code:"LINK_REQUIRES_VALID_BEARER" });
-
-  // 1) Aktuellen Benutzer & zugehöriges Profil ermitteln
-  let emailProfileId = null;
-  try {
-    const { data: authData, error: authErr } = await sbAdmin.auth.getUser(bearer);
-    if (authErr) return deny(res, 403, { ok:false, code:"LINK_REQUIRES_VALID_BEARER" });
-    const authUserId = authData?.user?.id || null;
-    if (!authUserId) return deny(res, 403, { ok:false, code:"LINK_REQUIRES_VALID_BEARER" });
-
-    const { data: prof } = await sbAdmin
-      .from("profiles")
-      .select("id")
-      .eq("user_id", authUserId)
-      .maybeSingle();
-
-    // Falls der Nutzer noch kein Profile hat, eines anlegen (idempotent)
-    if (prof?.id) {
-      emailProfileId = prof.id;
-    } else {
-      const { data: created, error: pErr } = await sbAdmin
-        .from("profiles")
-        .insert({ user_id: authUserId })
-        .select("id")
-        .single();
-      if (pErr) return deny(res, 500, { ok:false, code:"PROFILE_CREATE_ERROR" });
-      emailProfileId = created.id;
-    }
-  } catch {
-    return deny(res, 500, { ok:false, code:"PROFILE_RESOLVE_ERROR" });
+  stage(res, "link:begin", { hasBearer: !!bearer, emailProfileId: !!emailProfileId });
+  if (!bearer || !emailProfileId) {
+    return deny(res, 403, { ok:false, code:"LINK_REQUIRES_VALID_BEARER" });
   }
 
-  // 2) Besitzstand der Wallet lesen
+  // 1) Aktuellen Besitzstand lesen
   const { data: existing, error: exErr } = await sbAdmin
     .from("wallets")
-    .select("user_id")
+    .select("address,user_id")
     .eq("address", addressLower)
     .maybeSingle();
   if (exErr) return deny(res, 500, { ok:false, code:"DB_SELECT_ERROR" });
 
-  // a) gehört bereits jemand anderem? → sofort 409
+  // a) Wallet gehört schon jemand anderem -> sofort abbrechen
   if (existing?.user_id && existing.user_id !== emailProfileId) {
     return deny(res, 409, {
       ok:false,
@@ -269,53 +241,45 @@ if (intent === "link") {
     });
   }
 
-  // 3) Atomar „claimen“: nur wenn (noch) unassigned
-  const { data: upd, error: linkErr } = await sbAdmin
+  // 2) Optimistisches Upsert – nur übernehmen, wenn (noch) unassigned
+  //    Dank UNIQUE(wallets.lower(address)) kein doppeltes Einfügen möglich.
+  const { data: up, error: upErr } = await sbAdmin
     .from("wallets")
-    .update({ user_id: emailProfileId })
-    .eq("address", addressLower)
-    .is("user_id", null)
-    .select("user_id");
-  if (linkErr) return deny(res, 500, { ok:false, code:"LINK_ERROR" });
+    .upsert(
+      { address: addressLower, user_id: emailProfileId },
+      { onConflict: "address", ignoreDuplicates: false }
+    )
+    .select("user_id")
+    .single();
 
-  if (!upd || upd.length === 0) {
-    // Lost race: nochmal lesen und bewerten
+  // 23505 = unique_violation (Race). Danach Besitzstand erneut prüfen:
+  if (upErr && String(upErr.code) === "23505") {
     const { data: again } = await sbAdmin
       .from("wallets")
       .select("user_id")
       .eq("address", addressLower)
       .maybeSingle();
 
-    if (!again?.user_id) {
-      // immer noch nicht verknüpft → Race/Retry dem Client melden
-      return deny(res, 409, { ok:false, code:"LINK_RACE_CONFLICT" });
-    }
-    if (again.user_id !== emailProfileId) {
-      // wurde in der Zwischenzeit von jemand anders belegt → blocken
+    if (!again || (again.user_id && again.user_id !== emailProfileId)) {
       return deny(res, 409, {
         ok:false,
         code:"WALLET_ALREADY_LINKED",
         message:"This wallet is already linked to another profile."
       });
     }
-    walletUserId = again.user_id;
-  } else {
-    walletUserId = upd[0]?.user_id ?? emailProfileId;
+  } else if (upErr) {
+    return deny(res, 500, { ok:false, code:"LINK_ERROR" });
+  }
+
+  // 3) Sicherheitscheck: falls das Upsert einen fremden user_id ergeben hätte
+  if ((up?.user_id ?? existing?.user_id ?? null) !== emailProfileId) {
+    return deny(res, 409, { ok:false, code:"WALLET_ALREADY_LINKED" });
   }
 
   isRegistered = true;
-  // Session setzen wie gehabt …
-  stage(res, "session:set");
-  const payload = { v:1, addr: addressLower, userId: walletUserId, ts: Date.now(), exp: Date.now() + SESSION_TTL_SEC * 1000 };
-  const raw = JSON.stringify(payload);
-  const sig = sign(raw);
-  const sessionValue = Buffer.from(JSON.stringify(sig ? { raw, sig } : { raw })).toString("base64");
-  clearCookie(res, COOKIE_NONCE);
-  setCookie(res, COOKIE_SESSION, sessionValue, { maxAgeSec: SESSION_TTL_SEC });
-
-  stage(res, "ok");
-  return res.status(200).json({ ok:true, address: addressLower, userId: walletUserId, linked: true });
+  walletUserId = emailProfileId;
 }
+
     // NORMALER SIGN-IN (kein Link)
     if (intent !== "link") {
       stage(res, "normal:gate", { isRegistered, walletUserId, emailProfileId: !!emailProfileId });
