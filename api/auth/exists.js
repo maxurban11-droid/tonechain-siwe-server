@@ -15,14 +15,8 @@ function originAllowed(origin) {
     const u = new URL(origin);
     const host = u.hostname;
 
-    // explizit erlaubte Hosts
     if (ALLOWED_DOMAINS.has(host)) return true;
-
-    // alle Framer-Previews zulassen
-    if (host.endsWith(".framer.app") || host.endsWith(".framer.website"))
-      return true;
-
-    // lokale Entwicklung
+    if (host.endsWith(".framer.app") || host.endsWith(".framer.website")) return true;
     if (host === "localhost" || host === "127.0.0.1") return true;
 
     return false;
@@ -47,53 +41,38 @@ export default async function handler(req, res) {
     "Access-Control-Allow-Headers",
     "Content-Type, Authorization, X-TC-Intent"
   );
-  if (req.method === "OPTIONS") {
-    return res.status(204).end();
-  }
-  if (req.method !== "GET") {
-    return res
-      .status(405)
-      .json({ ok: false, code: "METHOD_NOT_ALLOWED", message: "Use GET" });
-  }
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method !== "GET")
+    return res.status(405).json({ ok: false, code: "METHOD_NOT_ALLOWED", message: "Use GET" });
+
   // Origin-Gate (nach Preflight)
-  if (!allowed) {
-    return res.status(403).json({
-      ok: false,
-      code: "ORIGIN_NOT_ALLOWED",
-      message: "Origin denied",
-    });
-  }
+  if (!allowed)
+    return res.status(403).json({ ok: false, code: "ORIGIN_NOT_ALLOWED", message: "Origin denied" });
 
   // --- ENV prüfen (Admin-Client) ---
   const SUPABASE_URL = process.env.SUPABASE_URL;
   const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-    return res
-      .status(500)
-      .json({ ok: false, code: "SERVER_CONFIG_MISSING" });
-  }
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY)
+    return res.status(500).json({ ok: false, code: "SERVER_CONFIG_MISSING" });
 
   // --- Adresse prüfen ---
   const raw = String(req.query.address || "").trim();
-  if (!raw) {
-    return res
-      .status(400)
-      .json({ ok: false, code: "MISSING_ADDRESS", message: "Missing ?address" });
-  }
-  const address = raw.toLowerCase();
-  if (!/^0x[0-9a-f]{40}$/.test(address)) {
-    return res
-      .status(400)
-      .json({ ok: false, code: "INVALID_ADDRESS", message: "Invalid wallet" });
-  }
+  if (!raw)
+    return res.status(400).json({ ok: false, code: "MISSING_ADDRESS", message: "Missing ?address" });
 
-  // --- optionaler Bearer (für linkedToMe) ---
-  const auth =
-    req.headers.authorization ||
-    req.headers.Authorization ||
-    "";
+  const address = raw.toLowerCase();
+  if (!/^0x[0-9a-f]{40}$/.test(address))
+    return res.status(400).json({ ok: false, code: "INVALID_ADDRESS", message: "Invalid wallet" });
+
+  // --- Bearer ist für diese sicherheitskritische Abfrage Pflicht ---
+  const auth = req.headers.authorization || req.headers.Authorization || "";
   const m = String(auth).match(/^Bearer\s+(.+)$/i);
   const bearer = m ? m[1] : null;
+  if (!bearer) {
+    // Wichtig: 401 zurückgeben, damit der Client „no-bearer“ sauber erkennt
+    res.setHeader("Cache-Control", "no-store");
+    return res.status(401).json({ ok: false, code: "MISSING_BEARER" });
+  }
 
   // --- Supabase Admin-Client ---
   const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
@@ -101,24 +80,21 @@ export default async function handler(req, res) {
   });
 
   try {
-    // Wenn Bearer vorhanden: aktuelles Profil ermitteln
-    let myProfileId = null;
-    if (bearer) {
-      try {
-        const { data: authData } = await sb.auth.getUser(bearer);
-        const authUserId = authData?.user?.id || null;
-        if (authUserId) {
-          const { data: prof } = await sb
-            .from("profiles")
-            .select("id")
-            .eq("user_id", authUserId)
-            .maybeSingle();
-          myProfileId = prof?.id ?? null;
-        }
-      } catch {
-        // absichtlich stumm – linkedToMe fällt dann auf false zurück
-      }
+    // Aktuellen Benutzer verifizieren → Profil-ID holen
+    const { data: authData, error: authErr } = await sb.auth.getUser(bearer);
+    if (authErr || !authData?.user) {
+      res.setHeader("Cache-Control", "no-store");
+      return res.status(401).json({ ok: false, code: "INVALID_BEARER" });
     }
+
+    const authUserId = authData.user.id;
+    let myProfileId = null;
+    const { data: prof } = await sb
+      .from("profiles")
+      .select("id")
+      .eq("user_id", authUserId)
+      .maybeSingle();
+    myProfileId = prof?.id ?? null;
 
     // Wallet nachschlagen (immer in lower-case)
     const { data: w, error } = await sb
@@ -129,30 +105,28 @@ export default async function handler(req, res) {
 
     if (error) {
       console.error("[exists] DB query failed:", error);
-      return res
-        .status(500)
-        .json({ ok: false, code: "DB_ERROR", message: error.message });
+      res.setHeader("Cache-Control", "no-store");
+      return res.status(500).json({ ok: false, code: "DB_ERROR", message: error.message });
     }
 
     const exists = !!w;
-    // Nur wenn Bearer mitgesendet wurde, linkedToMe berechnen
-    const body =
-      bearer && myProfileId
-        ? { ok: true, exists, linkedToMe: exists ? w?.user_id === myProfileId : false }
-        : { ok: true, exists };
+    const linkedToAny = !!w?.user_id;
+    const linkedToMe = !!(linkedToAny && myProfileId && w.user_id === myProfileId);
+    const linkedToOther = !!(linkedToAny && myProfileId && w.user_id !== myProfileId);
 
-    // Caching:
-    // - mit Bearer (nutzerbezogen): no-store
-    // - ohne Bearer: public Cache
-    if (bearer) {
-      res.setHeader("Cache-Control", "no-store");
-    } else {
-      res.setHeader("Cache-Control", `public, max-age=${CACHE_TTL_SEC}, must-revalidate`);
-    }
-
-    return res.status(200).json(body);
+    // Nutzerbezogene Antwort → nicht cachen
+    res.setHeader("Cache-Control", "no-store");
+    return res.status(200).json({
+      ok: true,
+      exists,
+      linkedToMe,
+      linkedToOther,
+      // optional informativ:
+      linked: linkedToAny,
+    });
   } catch (e) {
     console.error("[exists] Unexpected error:", e);
+    res.setHeader("Cache-Control", "no-store");
     return res.status(500).json({
       ok: false,
       code: "INTERNAL_ERROR",
