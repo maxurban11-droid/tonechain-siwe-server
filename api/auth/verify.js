@@ -219,63 +219,102 @@ async function handler(req, res) {
 
     // LINK
 if (intent === "link") {
-  stage(res, "link:begin", { hasBearer: !!bearer, emailProfileId: !!emailProfileId });
-  if (!bearer || !emailProfileId) {
+  stage(res, "link:begin");
+
+  // 0) E-Mail-Session muss gültig sein
+  if (!bearer) {
     return deny(res, 403, { ok:false, code:"LINK_REQUIRES_VALID_BEARER" });
   }
 
-  // 1) aktueller Besitzstand
-const { data: existing, error: exErr } = await sbAdmin
-  .from("wallets")
-  .select("user_id")
-  .eq("address", addressLower)
-  .maybeSingle();
-if (exErr) return deny(res, 500, { ok:false, code:"DB_SELECT_ERROR" });
+  // 1) Aktuellen Auth-User & sein Profile ermitteln/erzeugen
+  let emailProfileId = null;
+  try {
+    const { data: authData, error: authErr } = await sbAdmin.auth.getUser(bearer);
+    if (authErr) {
+      return deny(res, 403, { ok:false, code:"LINK_REQUIRES_VALID_BEARER" });
+    }
+    const authUserId = authData?.user?.id || null;
+    if (!authUserId) {
+      return deny(res, 403, { ok:false, code:"LINK_REQUIRES_VALID_BEARER" });
+    }
 
-// a) Gehört bereits jemand anderem → sofort blocken
-if (existing?.user_id && existing.user_id !== emailProfileId) {
-  return deny(res, 409, {
-    ok:false,
-    code:"WALLET_ALREADY_LINKED",
-    message:"This wallet is already linked to another profile."
-  });
-}
+    // bestehendes Profil?
+    const { data: profExisting } = await sbAdmin
+      .from("profiles")
+      .select("id")
+      .eq("user_id", authUserId)
+      .maybeSingle();
 
-// 2) Atomisch claimen: nur wenn noch unassigned
-const { data: upd, error: updErr } = await sbAdmin
-  .from("wallets")
-  .update({ user_id: emailProfileId })
-  .eq("address", addressLower)
-  .is("user_id", null)
-  .select("user_id")
-  .maybeSingle();
+    if (profExisting?.id) {
+      emailProfileId = profExisting.id;
+    } else {
+      // minimal anlegen (creator_name optional)
+      const { data: profNew, error: pErr } = await sbAdmin
+        .from("profiles")
+        .insert({ user_id: authUserId })
+        .select("id")
+        .single();
+      if (pErr) {
+        return deny(res, 500, { ok:false, code:"PROFILE_CREATE_ERROR" });
+      }
+      emailProfileId = profNew.id;
+    }
+  } catch {
+    return deny(res, 403, { ok:false, code:"LINK_REQUIRES_VALID_BEARER" });
+  }
 
-if (updErr) {
-  return deny(res, 500, { ok:false, code:"LINK_ERROR" });
-}
-
-// 3) Nichts geändert? -> Race prüfen & sauber antworten
-if (!upd) {
-  const { data: again } = await sbAdmin
+  // 2) Besitzstand der Wallet lesen
+  const { data: existing, error: exErr } = await sbAdmin
     .from("wallets")
     .select("user_id")
     .eq("address", addressLower)
     .maybeSingle();
+  if (exErr) return deny(res, 500, { ok:false, code:"DB_SELECT_ERROR" });
 
-  if (!again?.user_id) {
-    return deny(res, 409, { ok:false, code:"LINK_RACE_CONFLICT" });
-  }
-  if (again.user_id !== emailProfileId) {
+  // 2a) Wallet gehört schon jemand anderem → blocken
+  if (existing?.user_id && existing.user_id !== emailProfileId) {
     return deny(res, 409, {
-      ok:false, code:"WALLET_ALREADY_LINKED",
+      ok:false,
+      code:"WALLET_ALREADY_LINKED",
       message:"This wallet is already linked to another profile."
     });
   }
-}
 
-// Erfolg
-isRegistered = true;
-walletUserId = emailProfileId;
+  // 3) Atomisch claimen: nur wenn (noch) frei
+  const { data: upd, error: updErr } = await sbAdmin
+    .from("wallets")
+    .update({ user_id: emailProfileId })
+    .eq("address", addressLower)
+    .is("user_id", null)
+    .select("user_id")
+    .maybeSingle();
+
+  if (updErr) {
+    return deny(res, 500, { ok:false, code:"LINK_ERROR" });
+  }
+
+  // 4) Nichts geändert? → Race prüfen
+  if (!upd) {
+    const { data: again } = await sbAdmin
+      .from("wallets")
+      .select("user_id")
+      .eq("address", addressLower)
+      .maybeSingle();
+
+    if (!again?.user_id) {
+      return deny(res, 409, { ok:false, code:"LINK_RACE_CONFLICT" });
+    }
+    if (again.user_id !== emailProfileId) {
+      return deny(res, 409, {
+        ok:false, code:"WALLET_ALREADY_LINKED",
+        message:"This wallet is already linked to another profile."
+      });
+    }
+  }
+
+  // Erfolg → setze Session wie gehabt
+  isRegistered = true;
+  walletUserId = emailProfileId;
 }
 
     // NORMALER SIGN-IN (kein Link)
