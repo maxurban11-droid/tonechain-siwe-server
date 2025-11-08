@@ -241,41 +241,31 @@ if (intent === "link") {
     });
   }
 
-  // 2) Optimistisches Upsert – nur übernehmen, wenn (noch) unassigned
-  //    Dank UNIQUE(wallets.lower(address)) kein doppeltes Einfügen möglich.
-  const { data: up, error: upErr } = await sbAdmin
-    .from("wallets")
-    .upsert(
-      { address: addressLower, user_id: emailProfileId },
-      { onConflict: "address", ignoreDuplicates: false }
-    )
-    .select("user_id")
-    .single();
-
-  // 23505 = unique_violation (Race). Danach Besitzstand erneut prüfen:
-  if (upErr && String(upErr.code) === "23505") {
-    const { data: again } = await sbAdmin
+  // 2) Nur „claimen“, wenn noch frei (user_id IS NULL). Keine Fremdüberschreibung möglich.
+  //    Falls die Row noch nicht existiert: erst Address-Row sicherstellen.
+  if (!existing) {
+    const { error: insErr } = await sbAdmin
       .from("wallets")
-      .select("user_id")
-      .eq("address", addressLower)
-      .maybeSingle();
-
-    if (!again || (again.user_id && again.user_id !== emailProfileId)) {
-      return deny(res, 409, {
-        ok:false,
-        code:"WALLET_ALREADY_LINKED",
-        message:"This wallet is already linked to another profile."
-      });
+      .insert({ address: addressLower })  // user_id absichtlich noch nicht setzen
+    if (insErr && String(insErr.code) !== "23505") {
+      return deny(res, 500, { ok:false, code:"LINK_ERROR" });
     }
-  } else if (upErr) {
-    return deny(res, 500, { ok:false, code:"LINK_ERROR" });
   }
-
-  // 3) Sicherheitscheck: falls das Upsert einen fremden user_id ergeben hätte
-  if ((up?.user_id ?? existing?.user_id ?? null) !== emailProfileId) {
+  const { data: upd, error: linkErr } = await sbAdmin
+    .from("wallets")
+    .update({ user_id: emailProfileId })
+    .eq("address", addressLower)
+    .is("user_id", null)
+    .select("user_id");
+  if (linkErr) return deny(res, 500, { ok:false, code:"LINK_ERROR" });
+  // Konnte nicht gesetzt werden -> entweder schon mir gehörend, oder fremd (oben geprüft)
+  const finalUserId = (upd && upd[0]?.user_id) || existing?.user_id || null;
+  if (!finalUserId) {
+    return deny(res, 409, { ok:false, code:"LINK_RACE_CONFLICT" });
+  }
+  if (finalUserId !== emailProfileId) {
     return deny(res, 409, { ok:false, code:"WALLET_ALREADY_LINKED" });
   }
-
   isRegistered = true;
   walletUserId = emailProfileId;
 }
