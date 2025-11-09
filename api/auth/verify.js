@@ -218,67 +218,66 @@ async function handler(req, res) {
     }
 
     // LINK
-if (intent === "link") {
-  stage(res, "link:begin", { hasBearer: !!bearer, emailProfileId: !!emailProfileId });
-  if (!bearer || !emailProfileId) {
-    return deny(res, 403, { ok:false, code:"LINK_REQUIRES_VALID_BEARER" });
-  }
+    if (intent === "link") {
+      stage(res, "link:begin", { hasBearer: !!bearer, emailProfileId: !!emailProfileId });
+      if (!bearer || !emailProfileId) {
+        return deny(res, 403, { ok:false, code:"LINK_REQUIRES_VALID_BEARER" });
+      }
 
-  // 1) Aktuellen Besitzstand lesen
-  const { data: existing, error: exErr } = await sbAdmin
-    .from("wallets")
-    .select("address,user_id")
-    .eq("address", addressLower)
-    .maybeSingle();
-  if (exErr) return deny(res, 500, { ok:false, code:"DB_SELECT_ERROR" });
+      // 1) Aktuellen Besitzstand lesen
+      const { data: existing, error: exErr } = await sbAdmin
+        .from("wallets")
+        .select("address,user_id")
+        .eq("address", addressLower)
+        .maybeSingle();
+      if (exErr) return deny(res, 500, { ok:false, code:"DB_SELECT_ERROR" });
 
-  // a) Wallet gehört schon jemand anderem -> sofort abbrechen
-  if (existing?.user_id && existing.user_id !== emailProfileId) {
-    return deny(res, 409, {
-      ok:false,
-      code:"WALLET_ALREADY_LINKED",
-      message:"This wallet is already linked to another profile."
-    });
-  }
+      // a) Wallet gehört schon jemand anderem -> sofort abbrechen
+      if (existing?.user_id && existing.user_id !== emailProfileId) {
+        return deny(res, 409, {
+          ok:false,
+          code:"WALLET_ALREADY_LINKED",
+          message:"This wallet is already linked to another profile."
+        });
+      }
 
-  // 2) Optimistisches Upsert – nur übernehmen, wenn (noch) unassigned
-  //    Dank UNIQUE(wallets.lower(address)) kein doppeltes Einfügen möglich.
-  const { data: up, error: upErr } = await sbAdmin
-    .from("wallets")
-    .upsert(
-      { address: addressLower, user_id: emailProfileId },
-      { onConflict: "address", ignoreDuplicates: false }
-    )
-    .select("user_id")
-    .single();
+      // 2) Optimistisches Upsert – nur übernehmen, wenn (noch) unassigned
+      const { data: up, error: upErr } = await sbAdmin
+        .from("wallets")
+        .upsert(
+          { address: addressLower, user_id: emailProfileId },
+          { onConflict: "address", ignoreDuplicates: false }
+        )
+        .select("user_id")
+        .single();
 
-  // 23505 = unique_violation (Race). Danach Besitzstand erneut prüfen:
-  if (upErr && String(upErr.code) === "23505") {
-    const { data: again } = await sbAdmin
-      .from("wallets")
-      .select("user_id")
-      .eq("address", addressLower)
-      .maybeSingle();
+      // 23505 = unique_violation (Race). Danach Besitzstand erneut prüfen:
+      if (upErr && String(upErr.code) === "23505") {
+        const { data: again } = await sbAdmin
+          .from("wallets")
+          .select("user_id")
+          .eq("address", addressLower)
+          .maybeSingle();
 
-    if (!again || (again.user_id && again.user_id !== emailProfileId)) {
-      return deny(res, 409, {
-        ok:false,
-        code:"WALLET_ALREADY_LINKED",
-        message:"This wallet is already linked to another profile."
-      });
+        if (!again || (again.user_id && again.user_id !== emailProfileId)) {
+          return deny(res, 409, {
+            ok:false,
+            code:"WALLET_ALREADY_LINKED",
+            message:"This wallet is already linked to another profile."
+          });
+        }
+      } else if (upErr) {
+        return deny(res, 500, { ok:false, code:"LINK_ERROR" });
+      }
+
+      // 3) Sicherheitscheck
+      if ((up?.user_id ?? existing?.user_id ?? null) !== emailProfileId) {
+        return deny(res, 409, { ok:false, code:"WALLET_ALREADY_LINKED" });
+      }
+
+      isRegistered = true;
+      walletUserId = emailProfileId;
     }
-  } else if (upErr) {
-    return deny(res, 500, { ok:false, code:"LINK_ERROR" });
-  }
-
-  // 3) Sicherheitscheck: falls das Upsert einen fremden user_id ergeben hätte
-  if ((up?.user_id ?? existing?.user_id ?? null) !== emailProfileId) {
-    return deny(res, 409, { ok:false, code:"WALLET_ALREADY_LINKED" });
-  }
-
-  isRegistered = true;
-  walletUserId = emailProfileId;
-}
 
     // NORMALER SIGN-IN (kein Link)
     if (intent !== "link") {
@@ -290,9 +289,23 @@ if (intent === "link") {
       }
     }
 
-    // Session setzen
+    // ----------------- Session setzen (MIT Faktoren & Level) -----------------
     stage(res, "session:set");
-    const payload = { v: 1, addr: addressLower, userId: walletUserId, ts: Date.now(), exp: Date.now() + SESSION_TTL_SEC * 1000 };
+
+    // ✅ Faktoren/Level berechnen – gilt für Sign-in & Link gleichermaßen
+    const factors = { wallet: true, email: !!emailProfileId };
+    const level = factors.wallet && factors.email ? "high" : "basic";
+
+    const payload = {
+      v: 1,
+      addr: addressLower,
+      userId: walletUserId,
+      ts: Date.now(),
+      exp: Date.now() + SESSION_TTL_SEC * 1000,
+      factors,   // 👈 neu
+      level      // 👈 neu
+    };
+
     const raw = JSON.stringify(payload);
     const sig = sign(raw);
     const sessionValue = Buffer.from(JSON.stringify(sig ? { raw, sig } : { raw })).toString("base64");
@@ -301,7 +314,14 @@ if (intent === "link") {
     setCookie(res, COOKIE_SESSION, sessionValue, { maxAgeSec: SESSION_TTL_SEC });
 
     stage(res, "ok");
-    return res.status(200).json({ ok:true, address: addressLower, userId: walletUserId, linked: intent === "link" });
+    return res.status(200).json({
+      ok: true,
+      address: addressLower,
+      userId: walletUserId,
+      linked: intent === "link",
+      level,             // optionales Echo
+      factors            // optionales Echo
+    });
   } catch (e) {
     console.error("[SIWE verify] unexpected error:", e);
     stage(res, "unexpected");
